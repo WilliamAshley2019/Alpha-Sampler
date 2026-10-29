@@ -13,3 +13,5 @@ some better form of sleeping non active elements.
 
 Currently pretty early into testing and it seems most of the functions are currently working
 some pretty cool sound effects and it is feeling pretty smooth.
+
+Note SignalSmith Stretch code was used rather than writing custom stretch functions - it is under MIT License see the license there.
