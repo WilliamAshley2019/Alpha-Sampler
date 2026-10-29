@@ -9,6 +9,9 @@ TODO see what I missed in terms of functionality that might be extractable from 
 on the sample from chan sampler.  I will likely need to let this fester and breed in my mind for a while to figure out what exactly I want to use with it.
 The slicing is a 100% to do though.
 
+TODO want to add sample export / render 
+
+
 TODO add sample render/export from the sampler.
 
 This is very early but audio functions and basic GUI seem to be working
