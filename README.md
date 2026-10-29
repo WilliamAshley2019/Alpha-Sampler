@@ -1,3 +1,13 @@
+Version 1.0.1 (or is it 1.0.2) hmmm
+Added GUI and drag and drop.  The next big tasks are:
+
+TODO add slice functions.... and
+TODO see what I missed in terms of functionality that might be extractable from Chan Sampler or other GPL3 projects. One thing was addding the multicolour functions
+on the sample from chan sampler.  I will likely need to let this fester and breed in my mind for a while to figure out what exactly I want to use with it.
+The slicing is a 100% to do though.
+
+TODO add sample render/export from the sampler.
+
 This is very early but audio functions and basic GUI seem to be working
 
 TODO add drag and drop feature
