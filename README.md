@@ -1,0 +1,15 @@
+This is very early but audio functions and basic GUI seem to be working
+
+TODO add drag and drop feature
+TODO add more visual representations in the scope section
+
+I may want to rework some of the visual layout currently as GUI layout may not be ideal.
+
+NOTE: This was based off of Lemon Studios sampler and involved a large port and reworking. 
+I mention what inspired it so as to not confuse it with Chan Sampler - which I actually would like to take a look at
+and see if there is anything I can borrow from Chan Sampler I havn't yet implemented into the plugin.
+Its still sort of CPU heavy at 4% so I will likely need to see what I can do to reduce the CPU load such as 
+some better form of sleeping non active elements.
+
+Currently pretty early into testing and it seems most of the functions are currently working
+some pretty cool sound effects and it is feeling pretty smooth.
