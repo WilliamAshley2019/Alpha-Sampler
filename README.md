@@ -13,6 +13,7 @@ TODO want to add sample export / render
 
 
 TODO add sample render/export from the sampler.
+TODO  the ever elusive integration with python scripting.. hmm need to see if edison scripts can some how be integrated.
 
 This is very early but audio functions and basic GUI seem to be working
 
