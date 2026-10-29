@@ -1,0 +1,48 @@
+{
+  "Name": "AlphaSampler",
+  "Version": "1.0.0",
+  "Factory Info": {
+    "Vendor": "William Ashley Music",
+    "URL": "https://williamashley.music",
+    "E-Mail": "contact@williamashley.music",
+    "Flags": {
+      "Unicode": true,
+      "Classes Discardable": false,
+      "Component Non Discardable": false,
+    },
+  },
+  "Classes": [
+    {
+      "CID": "ABCDEF019182FAEB57414D414153414D",
+      "Category": "Audio Module Class",
+      "Name": "AlphaSampler",
+      "Vendor": "William Ashley Music",
+      "Version": "1.0.0",
+      "SDKVersion": "VST 3.8.0",
+      "Sub Categories": [
+        "Instrument",
+        "Sampler",
+      ],
+      "Class Flags": 2,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+    {
+      "CID": "ABCDEF011234ABCD57414D414153414D",
+      "Category": "Component Controller Class",
+      "Name": "AlphaSampler",
+      "Vendor": "William Ashley Music",
+      "Version": "1.0.0",
+      "SDKVersion": "VST 3.8.0",
+      "Sub Categories": [
+        "Instrument",
+        "Sampler",
+      ],
+      "Class Flags": 2,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+  ],
+}
