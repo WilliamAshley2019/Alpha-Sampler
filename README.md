@@ -2,7 +2,7 @@ This is very early but audio functions and basic GUI seem to be working
 
 TODO add drag and drop feature
 TODO add more visual representations in the scope section
-
+TODO double check the loop modes start knob seems like it may not be linked. 
 I may want to rework some of the visual layout currently as GUI layout may not be ideal.
 
 NOTE: This was based off of Lemon Studios sampler and involved a large port and reworking. 
@@ -19,3 +19,4 @@ Currently pretty early into testing and it seems most of the functions are curre
 some pretty cool sound effects and it is feeling pretty smooth.
 
 Note SignalSmith Stretch code was used rather than writing custom stretch functions - it is under MIT License see the license there. https://github.com/Signalsmith-Audio/signalsmith-stretch
+
