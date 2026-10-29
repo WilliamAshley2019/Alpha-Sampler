@@ -11,6 +11,7 @@ TODO add sample render/export from the sampler.
 This is very early but audio functions and basic GUI seem to be working
 
 ~~TODO add drag and drop feature~~   DONE
+
 TODO add more visual representations in the scope section STILL CAN IMPROVE THE SCOPE
 TODO double check the loop modes start knob seems like it may not be linked. 
 I may want to rework some of the visual layout currently as GUI layout may not be ideal.
