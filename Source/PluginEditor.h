@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -145,6 +146,51 @@ private:
     std::vector<float> history, peakHistory;
     size_t index = 0;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ScopeView)
+};
+
+// Watches every parameter for UI gestures (knob drags, combo/toggle changes) so the waveform
+// display can show what is being tweaked. Host automation (no gesture) is ignored.
+class TweakWatcher final : private juce::AudioProcessorParameter::Listener
+{
+public:
+    explicit TweakWatcher (juce::AudioProcessor&);
+    ~TweakWatcher() override;
+    juce::AudioProcessorParameter* active() const;   // message thread; nullptr when idle
+
+private:
+    void parameterValueChanged (int, float) override;
+    void parameterGestureChanged (int, bool) override;
+
+    juce::AudioProcessor& proc;
+    std::atomic<int> index { -1 }, held { 0 };
+    std::atomic<juce::uint32> stamp { 0 };
+};
+
+// The big display under the header. Idle: the current (processed) waveform with loop points and
+// start offset. While a control is being tweaked: a picture of that parameter's effect on the
+// source waveform (region, fades, filter response, envelope, stretch...). Also the drop target look.
+class WaveformView final : public juce::Component
+{
+public:
+    explicit WaveformView (juce::AudioProcessorValueTreeState&);
+    void setWave (std::shared_ptr<const WaveView>);
+    void setTweak (juce::AudioProcessorParameter*);   // call every tick; repaints only on change
+    void setDragHover (bool);
+    void setBusy (bool);
+    void paint (juce::Graphics&) override;
+
+private:
+    void paintIdle  (juce::Graphics&, juce::Rectangle<float> area, juce::Rectangle<float> header);
+    void paintTweak (juce::Graphics&, juce::Rectangle<float> area, juce::Rectangle<float> header);
+    float norm (const juce::String& id) const;
+    float val  (const juce::String& id) const;
+
+    juce::AudioProcessorValueTreeState& apvts;
+    std::shared_ptr<const WaveView> wave;
+    juce::AudioProcessorParameter* tweak = nullptr;
+    float tweakValue = -1.0f;
+    bool hover = false, busy = false;
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WaveformView)
 };
 
 // ---- parameter cells ---------------------------------------------------------
@@ -302,6 +348,7 @@ private:
 
 // ---- the editor ---------------------------------------------------------------
 class AlphaSamplerAudioProcessorEditor final : public juce::AudioProcessorEditor,
+                                               public juce::FileDragAndDropTarget,
                                                private juce::Timer
 {
 public:
@@ -311,14 +358,23 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
 
+    // Drag & drop a sample file onto the window to load it.
+    bool isInterestedInFileDrag (const juce::StringArray& files) override;
+    void fileDragEnter (const juce::StringArray& files, int x, int y) override;
+    void fileDragExit (const juce::StringArray& files) override;
+    void filesDropped (const juce::StringArray& files, int x, int y) override;
+
 private:
     void timerCallback() override;
 
     AlphaSamplerAudioProcessor& processor;
+    TweakWatcher watcher { processor };
+    uint32_t shownWave = 0;
     pt::ui::AlumLookAndFeel lookAndFeel;
 
     juce::Label title, subtitle, status, scopeLabel, meterLabelOut, meterLabelPeak;
     ScopeView scope;
+    WaveformView waveform { processor.apvts() };
     LevelMeter outMeter { pt::ui::col::cyan };
     LevelMeter peakMeter { pt::ui::col::missed.brighter (0.25f) };
     float shown = 0.0f, hold = 0.0f;

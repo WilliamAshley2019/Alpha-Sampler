@@ -415,6 +415,22 @@ struct Sample
     bool empty() const noexcept { return left.empty(); }
 };
 
+// Peak summary of a sample for the editor's waveform display (min/max per column).
+struct Peaks
+{
+    std::vector<float> lo, hi;
+    bool empty() const noexcept { return lo.empty(); }
+};
+
+struct WaveView
+{
+    Peaks raw;                    // the file as loaded
+    Peaks proc;                   // after the effects/stretch pipeline (what voices play)
+    double rate = 0.0;            // sample rate of the processed sample
+    double raw_frames = 0.0, proc_frames = 0.0;
+    double loop_a = -1.0, loop_b = -1.0;   // loop points as fractions of `proc`, or -1
+};
+
 struct WavTags
 {
     std::optional<uint8_t> unity_note;
@@ -1028,6 +1044,11 @@ public:
     std::atomic<int> voices_active { 0 };
     std::atomic<int> load_state { 0 }; // 0 idle, 1 working, 2 failed
 
+    // Waveform summary, rebuilt on the worker thread whenever the sample or its effects change.
+    // wave_serial increments on every change; waveView() is safe from the message thread.
+    std::atomic<uint32_t> wave_serial { 0 };
+    std::shared_ptr<const WaveView> waveView() const;
+
 private:
     struct Worker;
 
@@ -1120,6 +1141,13 @@ private:
     std::shared_ptr<const Processed> processed_;
     std::atomic<uint64_t> raw_version_ { 0 };
     uint64_t serial_ = 0;
+
+    mutable std::mutex wave_lock_;    // message thread <-> worker; never touched by the audio thread
+    std::shared_ptr<const WaveView> wave_;
+    std::shared_ptr<const Peaks> raw_peaks_;      // work_lock_
+    uint64_t raw_peaks_version_ = ~uint64_t { 0 };
+    void set_wave(std::shared_ptr<const WaveView> w);
+    std::shared_ptr<const Peaks> raw_peaks_for(uint64_t version, const juce::File& path, const Sample* raw);
 
     std::mutex published_lock_;       // audio thread only try_locks this
     std::shared_ptr<const Processed> published_;

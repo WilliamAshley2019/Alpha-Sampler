@@ -541,6 +541,93 @@ struct AlphaSamplerAudioProcessor::Worker final : juce::Thread
 };
 
 // ============================================================================
+// Waveform summaries for the editor.
+// ============================================================================
+namespace {
+constexpr int PEAK_COLUMNS = 2048;
+
+Peaks peaks_of(const float* l, const float* r, size_t n)
+{
+    Peaks p;
+    if (n == 0 || l == nullptr) return p;
+    const size_t cols = std::min<size_t>(PEAK_COLUMNS, n);
+    p.lo.assign(cols, 0.0f);
+    p.hi.assign(cols, 0.0f);
+    for (size_t c = 0; c < cols; ++c) {
+        const size_t a = c * n / cols, b = std::max(a + 1, (c + 1) * n / cols);
+        float lo = l[a], hi = l[a];
+        for (size_t i = a; i < b; ++i) {
+            lo = std::min(lo, l[i]); hi = std::max(hi, l[i]);
+            if (r != nullptr) { lo = std::min(lo, r[i]); hi = std::max(hi, r[i]); }
+        }
+        p.lo[c] = lo; p.hi[c] = hi;
+    }
+    return p;
+}
+
+Peaks peaks_of(const Sample& s)
+{
+    const size_t n = s.left.size();
+    return peaks_of(s.left.data(), s.right.size() == n ? s.right.data() : nullptr, n);
+}
+
+// Streams the file in chunks so a huge disk-streamed sample is never fully resident.
+Peaks peaks_of_file(juce::AudioFormatManager& formats, const juce::File& path)
+{
+    Peaks p;
+    std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(path));
+    if (!reader || reader->lengthInSamples <= 0) return p;
+    const auto total = static_cast<size_t>(reader->lengthInSamples);
+    const size_t cols = std::min<size_t>(PEAK_COLUMNS, total);
+    p.lo.assign(cols, 0.0f);
+    p.hi.assign(cols, 0.0f);
+    std::vector<char> seen(cols, 0);
+    constexpr int CHUNK = 1 << 16;
+    juce::AudioBuffer<float> buf(static_cast<int>(std::max<unsigned>(1, std::min<unsigned>(2, reader->numChannels))), CHUNK);
+    for (size_t pos = 0; pos < total; pos += CHUNK) {
+        const int len = static_cast<int>(std::min<size_t>(CHUNK, total - pos));
+        buf.clear();
+        if (!reader->read(&buf, 0, len, static_cast<juce::int64>(pos), true, true)) break;
+        for (int ch = 0; ch < buf.getNumChannels(); ++ch) {
+            const float* d = buf.getReadPointer(ch);
+            for (int i = 0; i < len; ++i) {
+                const size_t c = std::min(cols - 1, (pos + static_cast<size_t>(i)) * cols / total);
+                if (!seen[c]) { p.lo[c] = p.hi[c] = d[i]; seen[c] = 1; }
+                else { p.lo[c] = std::min(p.lo[c], d[i]); p.hi[c] = std::max(p.hi[c], d[i]); }
+            }
+        }
+    }
+    return p;
+}
+} // namespace
+
+std::shared_ptr<const WaveView> AlphaSamplerAudioProcessor::waveView() const
+{
+    const std::lock_guard<std::mutex> lk(wave_lock_);
+    return wave_;
+}
+
+void AlphaSamplerAudioProcessor::set_wave(std::shared_ptr<const WaveView> w)
+{
+    {
+        const std::lock_guard<std::mutex> lk(wave_lock_);
+        if (!w && !wave_) return;
+        wave_ = std::move(w);
+    }
+    wave_serial.fetch_add(1);
+}
+
+std::shared_ptr<const Peaks>
+AlphaSamplerAudioProcessor::raw_peaks_for(uint64_t version, const juce::File& path, const Sample* raw)
+{
+    if (raw_peaks_ && raw_peaks_version_ == version) return raw_peaks_;
+    auto p = std::make_shared<Peaks>(raw ? peaks_of(*raw) : peaks_of_file(library_.formats(), path));
+    raw_peaks_ = p;
+    raw_peaks_version_ = version;
+    return p;
+}
+
+// ============================================================================
 // Precompute pipeline.
 // ============================================================================
 void AlphaSamplerAudioProcessor::publish(std::shared_ptr<const Processed> p)
@@ -589,6 +676,8 @@ void AlphaSamplerAudioProcessor::update_impl()
 
     if (path.empty()) {
         if (!now || now->sample || now->disk) { frames->store(0); make([](Processed&) {}); }
+        raw_peaks_.reset(); raw_peaks_version_ = ~uint64_t { 0 };
+        set_wave(nullptr);
         return;
     }
 
@@ -614,6 +703,18 @@ void AlphaSamplerAudioProcessor::update_impl()
             auto played = std::make_shared<stream::Played>(disk, pts, old_disk.get());
             frames->store(static_cast<uint32_t>(lay->frames));
             make([&](Processed& np) { np.disk = played; np.looped = *stream_opt; np.file_frames = static_cast<double>(lay->frames); });
+            {
+                auto w = std::make_shared<WaveView>();
+                w->raw = *raw_peaks_for(v, juce::File(path), raw.get());
+                w->proc = w->raw;
+                w->rate = static_cast<double>(lay->rate);
+                w->raw_frames = w->proc_frames = static_cast<double>(lay->frames);
+                if (dk.loop_on && stream_opt->has_value() && lay->frames > 0 && (*stream_opt)->first < (*stream_opt)->second) {
+                    w->loop_a = static_cast<double>((*stream_opt)->first) / static_cast<double>(lay->frames);
+                    w->loop_b = static_cast<double>((*stream_opt)->second) / static_cast<double>(lay->frames);
+                }
+                set_wave(std::move(w));
+            }
             const std::lock_guard<std::mutex> lk(state_lock_);
             if (raw_version_.load() == v) raw_.reset();
             return;
@@ -630,11 +731,22 @@ void AlphaSamplerAudioProcessor::update_impl()
     }
     auto built = build(*raw, src, k);
     frames->store(static_cast<uint32_t>(built.sample.frames()));
+    auto wave = std::make_shared<WaveView>();
+    wave->raw = *raw_peaks_for(v, juce::File(path), raw.get());
+    wave->proc = peaks_of(built.sample);
+    wave->rate = static_cast<double>(built.sample.rate);
+    wave->raw_frames = static_cast<double>(raw->frames());
+    wave->proc_frames = static_cast<double>(built.sample.frames());
+    if (built.looped && built.sample.frames() > 0 && built.looped->first < built.looped->second) {
+        wave->loop_a = static_cast<double>(built.looped->first) / static_cast<double>(built.sample.frames());
+        wave->loop_b = static_cast<double>(built.looped->second) / static_cast<double>(built.sample.frames());
+    }
     make([&](Processed& np) {
         np.sample = std::make_shared<Sample>(std::move(built.sample));
         np.looped = built.looped;
         np.file_frames = static_cast<double>(raw->frames()) * built.per_file_frame;
     });
+    set_wave(std::move(wave));
 }
 
 void AlphaSamplerAudioProcessor::load(const juce::File& path)

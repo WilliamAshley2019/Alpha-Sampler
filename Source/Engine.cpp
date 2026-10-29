@@ -5,7 +5,7 @@
 
 #include "PluginProcessor.h"
 
-#include "../third_party/signalsmith-stretch.h"
+#include "../ThirdParty/signalsmith-stretch.h"
 
 #include <algorithm>
 #include <array>

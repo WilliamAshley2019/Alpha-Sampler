@@ -532,6 +532,608 @@ void ScopeView::paint (juce::Graphics& g)
     g.drawText ("PEAK", b.reduced (6.f).removeFromTop (12.f), juce::Justification::topLeft, false);
 }
 
+// ---- TweakWatcher -----------------------------------------------------------
+TweakWatcher::TweakWatcher (juce::AudioProcessor& p) : proc (p)
+{
+    for (auto* prm : proc.getParameters()) prm->addListener (this);
+}
+
+TweakWatcher::~TweakWatcher()
+{
+    for (auto* prm : proc.getParameters()) prm->removeListener (this);
+}
+
+void TweakWatcher::parameterValueChanged (int i, float)
+{
+    if (held.load() > 0) { index.store (i); stamp.store (juce::Time::getMillisecondCounter()); }
+}
+
+void TweakWatcher::parameterGestureChanged (int i, bool starting)
+{
+    if (starting) { held.fetch_add (1); index.store (i); }
+    else if (held.load() > 0) held.fetch_sub (1);
+    stamp.store (juce::Time::getMillisecondCounter());
+}
+
+juce::AudioProcessorParameter* TweakWatcher::active() const
+{
+    const int i = index.load();
+    const auto& params = proc.getParameters();
+    if (i < 0 || i >= params.size()) return nullptr;
+    const auto age = juce::Time::getMillisecondCounter() - stamp.load();
+    const bool live = (held.load() > 0 && age < 15000u) || age < 1400u;   // linger briefly after release
+    return live ? params[i] : nullptr;
+}
+
+// ---- WaveformView -----------------------------------------------------------
+namespace
+{
+using GainFn = std::function<float (float)>;
+
+// Draws min/max peaks of [f0,f1] (fractions of the sample; f1 < f0 reverses) into r.
+void fillPeaks (juce::Graphics& g, const Peaks& pk, juce::Rectangle<float> r, float f0, float f1,
+                float gain, juce::Colour c, float fillAlpha, const GainFn& gfn = nullptr)
+{
+    if (pk.empty() || r.getWidth() < 2.0f) return;
+    const int n = (int) pk.lo.size();
+    const int px = juce::jmax (2, (int) r.getWidth());
+    const float mid = r.getCentreY(), amp = r.getHeight() * 0.5f * 0.94f;
+    const float span = (f1 - f0) / (float) px;
+    std::vector<juce::Point<float>> top, bot;
+    top.reserve ((size_t) px);
+    bot.reserve ((size_t) px);
+    for (int i = 0; i < px; ++i)
+    {
+        const float s = (float) i / (float) (px - 1);
+        const float t0 = f0 + (f1 - f0) * s;
+        const float ta = juce::jmin (t0, t0 + span), tb = juce::jmax (t0, t0 + span);
+        if (tb < 0.0f || ta > 1.0f) continue;
+        const int ca = juce::jlimit (0, n - 1, (int) std::floor (ta * (float) n));
+        const int cb = juce::jlimit (0, n - 1, (int) std::floor (tb * (float) n));
+        float lo = pk.lo[(size_t) ca], hi = pk.hi[(size_t) ca];
+        for (int k = ca + 1; k <= cb; ++k) { lo = juce::jmin (lo, pk.lo[(size_t) k]); hi = juce::jmax (hi, pk.hi[(size_t) k]); }
+        const float gn = gain * (gfn ? gfn (s) : 1.0f);
+        float a = hi * gn, b = lo * gn;
+        if (a < b) std::swap (a, b);
+        const float x = r.getX() + r.getWidth() * s;
+        top.push_back ({ x, mid - a * amp });
+        bot.push_back ({ x, mid - b * amp });
+    }
+    if (top.size() < 2) return;
+    juce::Path p;
+    p.startNewSubPath (top.front());
+    for (size_t i = 1; i < top.size(); ++i) p.lineTo (top[i]);
+    for (size_t i = bot.size(); i-- > 0;) p.lineTo (bot[i]);
+    p.closeSubPath();
+    g.setColour (c.withAlpha (fillAlpha));
+    g.fillPath (p);
+    g.setColour (c);
+    g.strokePath (p, juce::PathStrokeType (0.8f));
+}
+
+float filterMag (int type, float x, float q)
+{
+    const float d = juce::jmax (1.0e-4f, std::sqrt ((1.0f - x * x) * (1.0f - x * x) + (x / q) * (x / q)));
+    switch (type)
+    {
+        case 2:  return (x / q) / d;
+        case 3:  return x * x / d;
+        case 4:  return std::abs (1.0f - x * x) / d;
+        case 5:
+        case 7:  { const float m = 1.0f / d; return m * m; }
+        default: return 1.0f / d;
+    }
+}
+
+float lfoShape (int shape, float phase)
+{
+    const float f = phase - std::floor (phase);
+    if (shape == 1) return 4.0f * std::abs (f - 0.5f) - 1.0f;
+    if (shape == 2) return f < 0.5f ? 1.0f : -1.0f;
+    return std::sin (juce::MathConstants<float>::twoPi * f);
+}
+
+float tensionCurve (float t, float tension) { return std::pow (juce::jlimit (0.0f, 1.0f, t), std::exp (-tension * 1.5f)); }
+} // namespace
+
+WaveformView::WaveformView (juce::AudioProcessorValueTreeState& a) : apvts (a) {}
+
+void WaveformView::setWave (std::shared_ptr<const WaveView> w) { wave = std::move (w); repaint(); }
+void WaveformView::setDragHover (bool h) { if (hover != h) { hover = h; repaint(); } }
+void WaveformView::setBusy (bool b) { if (busy != b) { busy = b; repaint(); } }
+
+void WaveformView::setTweak (juce::AudioProcessorParameter* p)
+{
+    const float v = p != nullptr ? p->getValue() : -1.0f;
+    if (p != tweak || v != tweakValue) { tweak = p; tweakValue = v; repaint(); }
+}
+
+float WaveformView::norm (const juce::String& id) const
+{
+    auto* q = apvts.getParameter (id);
+    return q != nullptr ? q->getValue() : 0.0f;
+}
+
+float WaveformView::val (const juce::String& id) const
+{
+    auto* q = apvts.getParameter (id);
+    return q != nullptr ? q->convertFrom0to1 (q->getValue()) : 0.0f;
+}
+
+void WaveformView::paint (juce::Graphics& g)
+{
+    const auto b = getLocalBounds().toFloat();
+    pt::ui::glassWell (g, b, 4.f);
+
+    auto inner = b.reduced (10.f, 6.f);
+    auto header = inner.removeFromTop (16.f);
+    auto area = inner.reduced (0.f, 2.f);
+
+    g.setColour (pt::ui::col::edgeLight.withAlpha (0.10f));
+    for (int i = 1; i < 10; ++i)
+        g.drawVerticalLine ((int) (area.getX() + area.getWidth() * (float) i / 10.f), area.getY(), area.getBottom());
+    g.drawHorizontalLine ((int) area.getCentreY(), area.getX(), area.getRight());
+
+    if (tweak != nullptr) paintTweak (g, area, header);
+    else                  paintIdle (g, area, header);
+
+    if (hover)
+    {
+        g.setColour (pt::ui::col::amber.withAlpha (0.16f));
+        g.fillRoundedRectangle (b.reduced (2.f), 4.f);
+        g.setColour (pt::ui::col::amber);
+        g.drawRoundedRectangle (b.reduced (3.f), 4.f, 2.0f);
+        g.setFont (pt::ui::caps (18.f));
+        g.drawText ("RELEASE TO LOAD SAMPLE", b, juce::Justification::centred, false);
+    }
+}
+
+void WaveformView::paintIdle (juce::Graphics& g, juce::Rectangle<float> area, juce::Rectangle<float> header)
+{
+    using namespace pt::ui;
+    g.setFont (caps (9.f));
+    g.setColour (col::textDim);
+    g.drawText ("WAVEFORM", header, juce::Justification::centredLeft, false);
+
+    if (wave == nullptr || wave->proc.empty())
+    {
+        g.setFont (caps (16.f));
+        g.setColour (col::textFaint);
+        g.drawText (busy ? "LOADING..." : "DROP A SAMPLE HERE", area.withTrimmedBottom (14.f), juce::Justification::centred, false);
+        if (!busy)
+        {
+            g.setFont (sans (11.f));
+            g.drawText ("WAV  AIFF  FLAC  OGG  MP3   -   or use LOAD on the SAMPLE tab", area.withTrimmedTop (area.getHeight() * 0.62f),
+                        juce::Justification::centredTop, false);
+        }
+        return;
+    }
+
+    const double secs = wave->rate > 0.0 ? wave->proc_frames / wave->rate : 0.0;
+    g.setColour (col::textDim);
+    g.drawText (juce::String (secs, 2) + " s   " + juce::String (wave->rate, 0) + " Hz", header, juce::Justification::centredRight, false);
+
+    if (wave->loop_a >= 0.0 && wave->loop_b > wave->loop_a && norm ("loop_use") > 0.5f)
+    {
+        const float xa = area.getX() + area.getWidth() * (float) wave->loop_a;
+        const float xb = area.getX() + area.getWidth() * (float) wave->loop_b;
+        g.setColour (col::amber.withAlpha (0.10f));
+        g.fillRect (juce::Rectangle<float> (xa, area.getY(), xb - xa, area.getHeight()));
+        g.setColour (col::amber.withAlpha (0.8f));
+        g.drawVerticalLine ((int) xa, area.getY(), area.getBottom());
+        g.drawVerticalLine ((int) xb, area.getY(), area.getBottom());
+    }
+
+    fillPeaks (g, wave->proc, area, 0.0f, 1.0f, 1.0f, col::cyan, 0.35f);
+
+    const float so = norm ("start_offset");
+    if (so > 0.0005f)
+    {
+        const float x = area.getX() + area.getWidth() * so;
+        g.setColour (col::good);
+        g.drawVerticalLine ((int) x, area.getY(), area.getBottom());
+        g.setFont (caps (9.f));
+        g.drawText ("START", juce::Rectangle<float> (x + 3.f, area.getY(), 60.f, 12.f), juce::Justification::centredLeft, false);
+    }
+}
+
+void WaveformView::paintTweak (juce::Graphics& g, juce::Rectangle<float> area, juce::Rectangle<float> header)
+{
+    using namespace pt::ui;
+    auto* rp = dynamic_cast<juce::RangedAudioParameter*> (tweak);
+    if (rp == nullptr) return;
+
+    const juce::String id = rp->paramID;
+    const bool have = wave != nullptr && ! wave->raw.empty();
+    const Peaks empty;
+    const Peaks& raw = have ? wave->raw : empty;
+    const auto amber = col::amber;
+    const float W = area.getWidth(), H = area.getHeight();
+    auto X = [&] (float f) { return area.getX() + W * f; };
+    auto yOf = [&] (float v) { return area.getCentreY() - v * H * 0.5f * 0.94f; };
+
+    g.setFont (caps (10.f));
+    g.setColour (amber);
+    g.drawText (rp->getName (48).toUpperCase(), header, juce::Justification::centredLeft, false);
+    g.setFont (caps (13.f));
+    g.setColour (col::text);
+    g.drawText (tweak->getCurrentValueAsText(), header, juce::Justification::centredRight, false);
+
+    auto dim = [&] { fillPeaks (g, raw, area, 0.0f, 1.0f, 1.0f, col::textDim, 0.22f); };
+    auto marker = [&] (float f, juce::Colour c, const juce::String& label)
+    {
+        g.setColour (c);
+        g.drawVerticalLine ((int) X (f), area.getY(), area.getBottom());
+        g.setFont (caps (9.f));
+        g.drawText (label, juce::Rectangle<float> (X (f) + 3.f, area.getY(), 70.f, 12.f), juce::Justification::centredLeft, false);
+    };
+    auto label = [&] (const juce::String& t)
+    {
+        g.setFont (caps (9.f));
+        g.setColour (col::textDim);
+        g.drawText (t, area.reduced (4.f), juce::Justification::topLeft, false);
+    };
+
+    // ---- envelopes and LFOs (ids look like "envpitch_att", "envpan_lfo_speed") ----
+    if (id.startsWith ("env") && id.containsChar ('_'))
+    {
+        dim();
+        const auto pre = id.upToFirstOccurrenceOf ("_", false, false);
+        const auto suf = id.fromFirstOccurrenceOf ("_", false, false);
+        const float pad = 14.f;
+        const auto plot = area.reduced (pad, pad);
+
+        if (suf.startsWith ("lfo_"))
+        {
+            const int shape = (int) std::lround (val (pre + "_lfo_shape"));
+            const float cycles = 2.0f + norm (pre + "_lfo_speed") * 12.0f;
+            const float d = norm (pre + "_lfo_delay") * 0.4f, a = norm (pre + "_lfo_att") * 0.4f;
+            const float amt = suf == "lfo_amt" ? std::abs (val (pre + "_lfo_amt")) : juce::jmax (0.25f, std::abs (val (pre + "_lfo_amt")));
+            juce::Path p;
+            const int steps = juce::jmax (64, (int) plot.getWidth());
+            for (int i = 0; i <= steps; ++i)
+            {
+                const float t = (float) i / (float) steps;
+                const float e = t < d ? 0.0f : (a <= 0.0f ? 1.0f : juce::jmin (1.0f, (t - d) / a));
+                const float y = plot.getCentreY() - lfoShape (shape, cycles * t) * e * amt * plot.getHeight() * 0.5f;
+                if (i == 0) p.startNewSubPath (plot.getX() + plot.getWidth() * t, y);
+                else        p.lineTo (plot.getX() + plot.getWidth() * t, y);
+            }
+            g.setColour (col::textFaint);
+            g.drawHorizontalLine ((int) plot.getCentreY(), plot.getX(), plot.getRight());
+            g.setColour (amber);
+            g.strokePath (p, juce::PathStrokeType (2.0f));
+            label ("LFO  -  " + pre.substring (3).toUpperCase());
+            return;
+        }
+
+        // DAHDSR
+        const char* names[] = { "delay", "att", "hold", "dec", "sus", "rel" };
+        float w[6];
+        float total = 0.0f;
+        for (int i = 0; i < 6; ++i) { w[i] = i == 4 ? 0.18f : 0.03f + 0.22f * norm (pre + "_" + names[i]); total += w[i]; }
+        const float sus = norm (pre + "_sus");
+        const float scale = suf == "amt" ? std::abs (val (pre + "_amt")) : 1.0f;
+        int activeSeg = -1;
+        if (suf == "delay") activeSeg = 0;
+        else if (suf == "att" || suf == "att_t") activeSeg = 1;
+        else if (suf == "hold") activeSeg = 2;
+        else if (suf == "dec" || suf == "dec_t") activeSeg = 3;
+        else if (suf == "sus") activeSeg = 4;
+        else if (suf == "rel" || suf == "rel_t") activeSeg = 5;
+
+        const float bottom = plot.getBottom(), hgt = plot.getHeight() * scale;
+        float x0 = plot.getX(), level = 0.0f;
+        for (int s = 0; s < 6; ++s)
+        {
+            const float x1 = x0 + plot.getWidth() * w[s] / total;
+            juce::Path p;
+            const int steps = 24;
+            float endLevel = level;
+            for (int i = 0; i <= steps; ++i)
+            {
+                const float t = (float) i / (float) steps;
+                float y = level;
+                switch (s)
+                {
+                    case 0: y = 0.0f; break;
+                    case 1: y = tensionCurve (t, val (pre + "_att_t")); break;
+                    case 2: y = 1.0f; break;
+                    case 3: y = 1.0f - (1.0f - sus) * tensionCurve (t, val (pre + "_dec_t")); break;
+                    case 4: y = sus; break;
+                    default: y = sus * (1.0f - tensionCurve (t, val (pre + "_rel_t"))); break;
+                }
+                endLevel = y;
+                const float px = x0 + (x1 - x0) * t, py = bottom - y * hgt;
+                if (i == 0) p.startNewSubPath (px, py); else p.lineTo (px, py);
+            }
+            g.setColour (s == activeSeg ? col::text : amber.withAlpha (activeSeg < 0 ? 1.0f : 0.55f));
+            g.strokePath (p, juce::PathStrokeType (s == activeSeg ? 3.0f : 2.0f));
+            g.setFont (caps (9.f));
+            g.setColour (s == activeSeg ? col::text : col::textDim);
+            static const char* tags[] = { "DLY", "ATK", "HLD", "DEC", "SUS", "REL" };
+            g.drawText (tags[s], juce::Rectangle<float> (x0, bottom + 1.f, x1 - x0, 12.f), juce::Justification::centred, false);
+            level = endLevel;
+            x0 = x1;
+        }
+        g.setColour (col::textFaint);
+        g.drawHorizontalLine ((int) bottom, plot.getX(), plot.getRight());
+        label ("ENVELOPE  -  " + pre.substring (3).toUpperCase());
+        return;
+    }
+
+    // ---- filters: frequency response ----
+    const bool precomputed = id == "fx_cut" || id == "fx_res";
+    const bool live = id == "f_cut" || id == "f_res" || id == "f_type";
+    if (precomputed || live || id == "fx_eq")
+    {
+        const auto plot = area.reduced (10.f, 8.f);
+        auto fx = [&] (float f) { return plot.getX() + plot.getWidth() * std::log (f / 20.0f) / std::log (1000.0f); };
+        auto dbY = [&] (float db) { return plot.getBottom() - plot.getHeight() * juce::jlimit (0.0f, 1.0f, (db + 48.0f) / 66.0f); };
+        g.setFont (caps (9.f));
+        for (float f : { 100.0f, 1000.0f, 10000.0f })
+        {
+            g.setColour (col::edgeLight.withAlpha (0.2f));
+            g.drawVerticalLine ((int) fx (f), plot.getY(), plot.getBottom());
+            g.setColour (col::textFaint);
+            g.drawText (f >= 1000.0f ? juce::String ((int) (f / 1000.0f)) + " k" : juce::String ((int) f),
+                        juce::Rectangle<float> (fx (f) + 2.f, plot.getBottom() - 12.f, 40.f, 12.f), juce::Justification::centredLeft, false);
+        }
+        g.setColour (col::edgeLight.withAlpha (0.3f));
+        g.drawHorizontalLine ((int) dbY (0.0f), plot.getX(), plot.getRight());
+
+        const int type = precomputed || id == "fx_eq" ? 1 : (int) std::lround (val ("f_type"));
+        const float fc = 20.0f * std::pow (1000.0f, norm (precomputed ? "fx_cut" : "f_cut"));
+        const float q = 0.6f + norm (precomputed ? "fx_res" : "f_res") * 8.0f;
+        const float eq = val ("fx_eq");
+        const int steps = juce::jmax (64, (int) plot.getWidth());
+        juce::Path p;
+        for (int i = 0; i <= steps; ++i)
+        {
+            const float f = 20.0f * std::pow (1000.0f, (float) i / (float) steps);
+            float db;
+            if (id == "fx_eq") db = eq * 12.0f * std::tanh (std::log2 (f / 1000.0f) * 0.7f);
+            else               db = 20.0f * std::log10 (juce::jmax (1.0e-4f, filterMag (type, f / fc, q)));
+            const float x = plot.getX() + plot.getWidth() * (float) i / (float) steps;
+            if (i == 0) p.startNewSubPath (x, dbY (db)); else p.lineTo (x, dbY (db));
+        }
+        juce::Path fill (p);
+        fill.lineTo (plot.getRight(), plot.getBottom());
+        fill.lineTo (plot.getX(), plot.getBottom());
+        fill.closeSubPath();
+        g.setColour (amber.withAlpha (0.12f));
+        g.fillPath (fill);
+        g.setColour (amber);
+        g.strokePath (p, juce::PathStrokeType (2.2f));
+        if (id != "fx_eq")
+        {
+            g.setColour (col::cyan.withAlpha (0.8f));
+            g.drawVerticalLine ((int) fx (fc), plot.getY(), plot.getBottom());
+        }
+        return;
+    }
+
+    // ---- keyboard ranges: root / zone ----
+    if (id == "root" || id == "zone_lo" || id == "zone_hi")
+    {
+        const float lo = val ("zone_lo"), hi = val ("zone_hi"), rt = val ("root");
+        const auto bar = area.withSizeKeepingCentre (area.getWidth() - 20.f, 26.f);
+        auto kx = [&] (float key) { return bar.getX() + bar.getWidth() * key / 131.0f; };
+        g.setColour (col::edgeLight.withAlpha (0.25f));
+        g.fillRoundedRectangle (bar, 3.f);
+        g.setColour (amber.withAlpha (0.45f));
+        g.fillRect (juce::Rectangle<float> (kx (lo), bar.getY(), juce::jmax (2.0f, kx (hi) - kx (lo)), bar.getHeight()));
+        g.setColour (col::cyan);
+        g.fillRect (juce::Rectangle<float> (kx (rt) - 1.5f, bar.getY() - 6.f, 3.f, bar.getHeight() + 12.f));
+        label ("ZONE  (amber)   ROOT  (cyan)");
+        return;
+    }
+
+    // ---- everything below draws over the source waveform ----
+    if (id == "fx_start" || id == "fx_length")
+    {
+        const float s = norm ("fx_start"), e = norm ("fx_length");
+        const float a = juce::jmin (s, e), z = juce::jmax (s, e);
+        dim();
+        g.saveState();
+        g.reduceClipRegion (juce::Rectangle<float> (X (a), area.getY(), X (z) - X (a), H).toNearestInt());
+        fillPeaks (g, raw, area, 0.0f, 1.0f, 1.0f, amber, 0.35f);
+        g.restoreState();
+        marker (s, amber, "START " + juce::String (s * 100.0f, 1) + "%");
+        g.setColour (amber);
+        g.drawVerticalLine ((int) X (e), area.getY(), area.getBottom());
+        g.setFont (caps (9.f));
+        g.drawText ("END " + juce::String (e * 100.0f, 1) + "%", juce::Rectangle<float> (X (e) - 73.f, area.getY(), 70.f, 12.f), juce::Justification::centredRight, false);
+        return;
+    }
+    if (id == "start_offset")
+    {
+        dim();
+        const float so = norm ("start_offset");
+        g.setColour (juce::Colours::black.withAlpha (0.35f));
+        g.fillRect (juce::Rectangle<float> (area.getX(), area.getY(), W * so, H));
+        marker (so, col::good, "PLAY FROM " + juce::String (so * 100.0f, 1) + "%");
+        return;
+    }
+    if (id.startsWith ("loop_") || id == "fx_loop_follows" || id == "fx_crossfade")
+    {
+        dim();
+        const float a = juce::jmin (norm ("loop_start"), norm ("loop_end")), b = juce::jmax (norm ("loop_start"), norm ("loop_end"));
+        g.setColour (col::cyan.withAlpha (0.14f));
+        g.fillRect (juce::Rectangle<float> (X (a), area.getY(), X (b) - X (a), H));
+        marker (a, col::cyan, "LOOP A");
+        g.setColour (col::cyan);
+        g.drawVerticalLine ((int) X (b), area.getY(), area.getBottom());
+        g.setFont (caps (9.f));
+        g.drawText ("LOOP B", juce::Rectangle<float> (X (b) - 53.f, area.getY(), 50.f, 12.f), juce::Justification::centredRight, false);
+        if (id == "loop_pingpong")
+        {
+            g.setFont (caps (22.f));
+            g.setColour (norm ("loop_pingpong") > 0.5f ? amber : col::textFaint);
+            g.drawText (juce::CharPointer_UTF8 ("\xe2\x87\x84"), juce::Rectangle<float> (X (a), area.getY(), X (b) - X (a), H), juce::Justification::centred, false);
+        }
+        if (id == "fx_crossfade")
+        {
+            const float w = norm ("fx_crossfade") * 0.25f * W;
+            const float x1 = X (b), x0 = x1 - w;
+            g.setColour (amber);
+            g.drawLine (x0, yOf (0.7f), x1, yOf (-0.7f), 2.f);
+            g.setColour (col::cyan);
+            g.drawLine (x0, yOf (-0.7f), x1, yOf (0.7f), 2.f);
+        }
+        return;
+    }
+    if (id == "fx_in" || id == "fx_out")
+    {
+        dim();
+        const float fi = norm ("fx_in") * 0.5f, fo = norm ("fx_out") * 0.5f;
+        g.setColour (amber);
+        juce::Path env;
+        env.startNewSubPath (X (0.0f), yOf (0.0f));
+        env.lineTo (X (fi), yOf (0.94f));
+        env.lineTo (X (1.0f - fo), yOf (0.94f));
+        env.lineTo (X (1.0f), yOf (0.0f));
+        g.strokePath (env, juce::PathStrokeType (2.f));
+        juce::Path envLow;
+        envLow.startNewSubPath (X (0.0f), yOf (0.0f));
+        envLow.lineTo (X (fi), yOf (-0.94f));
+        envLow.lineTo (X (1.0f - fo), yOf (-0.94f));
+        envLow.lineTo (X (1.0f), yOf (0.0f));
+        g.strokePath (envLow, juce::PathStrokeType (2.f));
+        fillPeaks (g, raw, area, 0.0f, 1.0f, 1.0f, amber, 0.3f,
+                   [fi, fo] (float t) { return juce::jmin (fi > 0.0f ? t / fi : 1.0f, fo > 0.0f ? (1.0f - t) / fo : 1.0f, 1.0f); });
+        return;
+    }
+    if (id == "fx_boost" || id == "fx_normalize" || id == "fx_clip" || id == "fx_trim" || id == "fx_dc")
+    {
+        dim();
+        float peak = 0.0f, mean = 0.0f;
+        for (size_t i = 0; i < raw.lo.size(); ++i) { peak = juce::jmax (peak, std::abs (raw.lo[i]), std::abs (raw.hi[i])); mean += 0.5f * (raw.lo[i] + raw.hi[i]); }
+        if (! raw.lo.empty()) mean /= (float) raw.lo.size();
+        g.setColour (col::textFaint);
+        g.drawHorizontalLine ((int) yOf (1.0f), area.getX(), area.getRight());
+        g.drawHorizontalLine ((int) yOf (-1.0f), area.getX(), area.getRight());
+        g.saveState();
+        g.reduceClipRegion (area.toNearestInt());
+        if (id == "fx_boost")
+            fillPeaks (g, raw, area, 0.0f, 1.0f, 1.0f + norm ("fx_boost") * 3.0f, amber, 0.3f);
+        else if (id == "fx_normalize")
+            fillPeaks (g, raw, area, 0.0f, 1.0f, peak > 1.0e-4f ? 1.0f / peak : 1.0f, amber, 0.3f);
+        else if (id == "fx_clip")
+        {
+            g.reduceClipRegion (juce::Rectangle<float> (area.getX(), yOf (0.7f), W, yOf (-0.7f) - yOf (0.7f)).toNearestInt());
+            fillPeaks (g, raw, area, 0.0f, 1.0f, 1.6f, amber, 0.3f);
+            g.setColour (amber);
+            g.drawHorizontalLine ((int) yOf (0.7f), area.getX(), area.getRight());
+            g.drawHorizontalLine ((int) yOf (-0.7f), area.getX(), area.getRight());
+        }
+        else if (id == "fx_trim")
+        {
+            const float thr = norm ("fx_trim") * 0.5f;
+            g.setColour (amber.withAlpha (0.18f));
+            g.fillRect (juce::Rectangle<float> (area.getX(), yOf (thr), W, yOf (-thr) - yOf (thr)));
+            g.setColour (amber);
+            g.drawHorizontalLine ((int) yOf (thr), area.getX(), area.getRight());
+            g.drawHorizontalLine ((int) yOf (-thr), area.getX(), area.getRight());
+        }
+        else
+        {
+            g.setColour (amber);
+            g.drawHorizontalLine ((int) yOf (mean * 4.0f), area.getX(), area.getRight());   // exaggerated x4
+            label ("DC OFFSET (x4)");
+        }
+        g.restoreState();
+        return;
+    }
+    if (id == "fx_reverse")
+    {
+        dim();
+        fillPeaks (g, raw, area, 1.0f, 0.0f, 1.0f, amber, 0.3f);
+        return;
+    }
+    if (id == "fx_polarity")
+    {
+        dim();
+        fillPeaks (g, raw, area, 0.0f, 1.0f, -1.0f, amber, 0.3f);
+        return;
+    }
+    if (id == "fx_rm_mix" || id == "fx_rm_freq")
+    {
+        dim();
+        const float mix = norm ("fx_rm_mix"), cycles = 2.0f + norm ("fx_rm_freq") * 60.0f;
+        fillPeaks (g, raw, area, 0.0f, 1.0f, 1.0f, amber, 0.3f,
+                   [=] (float t) { return (1.0f - mix) + mix * std::sin (juce::MathConstants<float>::twoPi * cycles * t); });
+        return;
+    }
+    if (id == "fx_reverb" || id == "fx_reverb_type")
+    {
+        const float amt = norm ("fx_reverb");
+        const auto body = area.withWidth (W * 0.6f);
+        fillPeaks (g, raw, body, 0.0f, 1.0f, 1.0f, col::textDim, 0.25f);
+        juce::Path tail;
+        const float x0 = body.getRight(), x1 = area.getRight();
+        const int steps = 120;
+        for (int i = 0; i <= steps; ++i)
+        {
+            const float t = (float) i / (float) steps;
+            const float e = (0.15f + 0.8f * amt) * std::exp (-t * (id == "fx_reverb_type" && norm ("fx_reverb_type") < 0.5f ? 3.0f : 2.0f));
+            const float x = x0 + (x1 - x0) * t;
+            if (i == 0) tail.startNewSubPath (x, yOf (e)); else tail.lineTo (x, yOf (e));
+        }
+        g.setColour (amber);
+        g.strokePath (tail, juce::PathStrokeType (2.f));
+        label ("REVERB TAIL");
+        return;
+    }
+    if (id == "fx_sdelay")
+    {
+        const float d = val ("fx_sdelay") * 0.2f;
+        auto top = area.removeFromTop (H * 0.5f);
+        fillPeaks (g, raw, top, d < 0.0f ? -d : 0.0f, d < 0.0f ? 1.0f - d : 1.0f, 1.0f, col::cyan, 0.3f);
+        fillPeaks (g, raw, area, d > 0.0f ? -d : 0.0f, d > 0.0f ? 1.0f - d : 1.0f, 1.0f, amber, 0.3f);
+        return;
+    }
+    if (id == "fx_pogo")
+    {
+        const float d = std::abs (val ("fx_pogo")) * 0.15f;
+        for (int i = 3; i >= 0; --i)
+            fillPeaks (g, raw, area, -d * (float) i, 1.0f - d * (float) i, std::pow (0.6f, (float) i), i == 0 ? amber : amber.withAlpha (0.5f), 0.15f);
+        return;
+    }
+    if (id == "ts_mul" || id == "ts_time")
+    {
+        const float factor = std::pow (2.0f, (norm (id) - 0.5f) * 4.0f) * (id == "ts_time" && norm (id) <= 0.0f ? 0.0f : 1.0f);
+        const float f = factor > 0.0f ? factor : 1.0f;
+        const float L = juce::jmax (1.0f, f);
+        fillPeaks (g, raw, area.withWidth (W / L), 0.0f, 1.0f, 1.0f, col::textDim, 0.2f);
+        fillPeaks (g, raw, area.withWidth (W * f / L), 0.0f, 1.0f, 1.0f, amber, 0.25f);
+        label (juce::String (f, 2) + "x  length");
+        return;
+    }
+    if (id == "ts_pitch" || id == "ts_mode")
+    {
+        dim();
+        const float cycles = 8.0f * std::pow (2.0f, (norm ("ts_pitch") - 0.5f) * 4.0f);
+        juce::Path p;
+        const int steps = juce::jmax (64, (int) W);
+        for (int i = 0; i <= steps; ++i)
+        {
+            const float t = (float) i / (float) steps;
+            const float y = area.getCentreY() - std::sin (juce::MathConstants<float>::twoPi * cycles * t) * H * 0.3f;
+            if (i == 0) p.startNewSubPath (X (t), y); else p.lineTo (X (t), y);
+        }
+        g.setColour (amber);
+        g.strokePath (p, juce::PathStrokeType (2.f));
+        return;
+    }
+
+    // ---- anything else: the waveform with the value highlighted ----
+    fillPeaks (g, raw, area, 0.0f, 1.0f, 1.0f, col::cyan, 0.25f);
+    g.setFont (caps (26.f));
+    g.setColour (amber.withAlpha (0.9f));
+    g.drawText (tweak->getCurrentValueAsText(), area, juce::Justification::centred, false);
+}
+
 // ---- KnobCell --------------------------------------------------------------
 KnobCell::KnobCell()
 {
@@ -903,12 +1505,13 @@ AlphaSamplerAudioProcessorEditor::AlphaSamplerAudioProcessorEditor (AlphaSampler
         addAndMakeVisible (l);
     };
     setup (title, "ALPHA SAMPLER", pt::ui::caps (20.f), pt::ui::col::text, juce::Justification::centredLeft);
-    setup (subtitle, "sample · stretch · filter", pt::ui::sans (11.f), pt::ui::col::textDim, juce::Justification::centredLeft);
+    setup (subtitle, "sample | stretch | filter", pt::ui::sans (11.f), pt::ui::col::textDim, juce::Justification::centredLeft);
     setup (status, "NO SAMPLE", pt::ui::caps (9.f), pt::ui::col::textDim, juce::Justification::centredRight);
     setup (scopeLabel, "SCOPE", pt::ui::caps (9.f), pt::ui::col::textDim, juce::Justification::centredLeft);
     setup (meterLabelOut, "OUT", pt::ui::caps (9.f), pt::ui::col::cyan, juce::Justification::centred);
     setup (meterLabelPeak, "PEAK", pt::ui::caps (9.f), pt::ui::col::missed.brighter (0.25f), juce::Justification::centred);
     addAndMakeVisible (scope);
+    addAndMakeVisible (waveform);
     addAndMakeVisible (outMeter);
     addAndMakeVisible (peakMeter);
 
@@ -923,8 +1526,8 @@ AlphaSamplerAudioProcessorEditor::AlphaSamplerAudioProcessorEditor (AlphaSampler
     tabs.setOutline (0);
     addAndMakeVisible (tabs);
 
-    setResizeLimits (860, 560, 1800, 1100);
-    setSize (1000, 680);
+    setResizeLimits (860, 700, 1800, 1200);
+    setSize (1000, 800);
     setResizable (true, true);
     startTimerHz (30);
 }
@@ -954,6 +1557,8 @@ void AlphaSamplerAudioProcessorEditor::resized()
     subtitle.setBounds (left);
     status.setBounds (header.removeFromRight (200));
     a.removeFromTop (8);
+    waveform.setBounds (a.removeFromTop (juce::jlimit (150, 260, a.getHeight() / 4)));
+    a.removeFromTop (8);
 
     auto right = a.removeFromRight (200);
     scopeLabel.setBounds (right.removeFromTop (14));
@@ -970,6 +1575,37 @@ void AlphaSamplerAudioProcessorEditor::resized()
     tabs.setBounds (a);
 }
 
+// ---- drag & drop ------------------------------------------------------------
+namespace
+{
+bool isSampleFile (const juce::String& path)
+{
+    const auto ext = juce::File (path).getFileExtension().toLowerCase();
+    return ext == ".wav" || ext == ".wave" || ext == ".aif" || ext == ".aiff" || ext == ".flac" || ext == ".ogg" || ext == ".mp3";
+}
+} // namespace
+
+bool AlphaSamplerAudioProcessorEditor::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    for (const auto& f : files) if (isSampleFile (f)) return true;
+    return false;
+}
+
+void AlphaSamplerAudioProcessorEditor::fileDragEnter (const juce::StringArray&, int, int) { waveform.setDragHover (true); }
+void AlphaSamplerAudioProcessorEditor::fileDragExit (const juce::StringArray&)            { waveform.setDragHover (false); }
+
+void AlphaSamplerAudioProcessorEditor::filesDropped (const juce::StringArray& files, int, int)
+{
+    waveform.setDragHover (false);
+    for (const auto& f : files)
+        if (isSampleFile (f))
+        {
+            processor.loadFile (juce::File (f));
+            samplePage.updateFileLabel();
+            break;
+        }
+}
+
 void AlphaSamplerAudioProcessorEditor::timerCallback()
 {
     const float m = juce::jmax (processor.meter_l.exchange (0.0f), processor.meter_r.exchange (0.0f));
@@ -978,6 +1614,14 @@ void AlphaSamplerAudioProcessorEditor::timerCallback()
     outMeter.setValue (shown);
     peakMeter.setValue (hold);
     scope.pushSample (shown, hold);
+
+    if (const auto serial = processor.wave_serial.load(); serial != shownWave)
+    {
+        shownWave = serial;
+        waveform.setWave (processor.waveView());
+    }
+    waveform.setTweak (watcher.active());
+    waveform.setBusy (processor.load_state.load() == 1);
 
     juce::String text;
     switch (processor.load_state.load())
