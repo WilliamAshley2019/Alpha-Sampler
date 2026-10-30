@@ -1,5 +1,7 @@
 Version 1.0.3
+
 Added a few more visual elements
+
 Added presets
 
 
