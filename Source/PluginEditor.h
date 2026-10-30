@@ -177,6 +177,7 @@ public:
     void setTweak (juce::AudioProcessorParameter*);   // call every tick; repaints only on change
     void setDragHover (bool);
     void setBusy (bool);
+    void setProcessor (AlphaSamplerAudioProcessor* p) { proc = p; }
     void setTempo (double bpm) { if (bpm != tempo) { tempo = bpm; if (grid == 2) repaint(); } }
     void paint (juce::Graphics&) override;
     void mouseDown (const juce::MouseEvent&) override;
@@ -191,7 +192,7 @@ private:
     juce::Rectangle<float> areaRect() const;
     float toFrac (float x) const;
     float toX (float frac, juce::Rectangle<float> a) const;
-    int markerAt (float x) const;   // 0 start, 1 loop A, 2 loop B, -1 none
+    int markerAt (float x) const;   // 0 start, 1 loop A, 2 loop B, 100+i slice i, -1 none
     void paintIdle  (juce::Graphics&, juce::Rectangle<float> area, juce::Rectangle<float> header);
     void paintTweak (juce::Graphics&, juce::Rectangle<float> area, juce::Rectangle<float> header);
     void paintGrid  (juce::Graphics&, juce::Rectangle<float> area);
@@ -208,6 +209,7 @@ private:
     int mode = Wave, grid = 0, drag = -1;
     float z0 = 0.0f, z1 = 1.0f, panAnchor = 0.0f;
     double tempo = 0.0;
+    AlphaSamplerAudioProcessor* proc = nullptr;
     std::vector<std::pair<juce::Rectangle<float>, int>> hits;
     juce::Image sonoImg;
     const Spectro* sonoFor = nullptr;
@@ -355,15 +357,39 @@ private:
 class MiscPage final : public juce::Component
 {
 public:
-    explicit MiscPage (juce::AudioProcessorValueTreeState&);
+    explicit MiscPage (AlphaSamplerAudioProcessor&);
     void resized() override;
+    void tick();
 
 private:
-    ChoiceCell root, zoneLo, zoneHi;
-    juce::Label fineLabel;
+    AlphaSamplerAudioProcessor& proc;
+    ChoiceCell root, zoneLo, zoneHi, sliceBase;
+    juce::Label fineLabel, sliceInfo;
     juce::Slider fine;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> fineAttachment;
-    ToggleCell mainPitch, addKey;
+    ToggleCell mainPitch, addKey, sliceOn;
+    juce::TextButton equalBtn { "EQUAL SLICES" }, transBtn { "TRANSIENTS" }, beatBtn { "BY BEAT" }, clearBtn { "CLEAR SLICES" }, exportBtn { "EXPORT SLICES" };
+    std::unique_ptr<juce::FileChooser> chooser;
+};
+
+class ToolsPage final : public juce::Component
+{
+public:
+    explicit ToolsPage (AlphaSamplerAudioProcessor&);
+    void resized() override;
+    void tick();
+
+private:
+    void saveAs (int mode);
+    void scriptMenu();
+    AlphaSamplerAudioProcessor& proc;
+    juce::TextButton renderBtn { "RENDER SAMPLE..." }, noteBtn { "RENDER NOTE..." }, recBtn { "REC" },
+                     scriptBtn { "SCRIPT..." }, runBtn { "RUN" }, revertBtn { "REVERT" }, pyBtn { "PYTHON..." };
+    juce::ToggleButton loadAfter { "load result as sample" };
+    juce::ComboBox source;
+    juce::Label recLabel, scriptLabel, pyLabel, statusLabel, h1, h2, h3;
+    std::unique_ptr<juce::FileChooser> chooser;
+    juce::File script;
 };
 
 // One envelope / LFO page (instantiated five times).
@@ -433,6 +459,7 @@ private:
     FxPage fxPage;
     FilterPage filterPage;
     MiscPage miscPage;
+    ToolsPage toolsPage;
     EnvTab envTab;
     juce::TabbedComponent tabs { juce::TabbedButtonBar::TabsAtTop };
 

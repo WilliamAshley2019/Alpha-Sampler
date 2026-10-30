@@ -99,16 +99,10 @@ std::shared_ptr<const Spectro> analyse(const Fetch& fetch, size_t frames, double
 }
 
 // ---- tempo ------------------------------------------------------------------
-// Onset envelope = log RMS of the first difference per 2.5 ms hop; autocorrelated over 60..200 BPM
-// with a mild prior around 120 BPM (octave errors are the usual failure: halve/double by hand).
-std::optional<double> detect_bpm(const std::vector<float>& x, double rate, double& beats_out)
+// Onset strength per hop: positive jumps in log RMS of the first difference, minus a 0.5 s running mean.
+static std::vector<float> onset_curve(const std::vector<float>& x, size_t hop, double fps)
 {
-    beats_out = 0.0;
-    const size_t hop = static_cast<size_t>(std::max(1.0, rate / 400.0));
-    const double fps = rate / static_cast<double>(hop);
     const size_t n = x.size() / hop;
-    if (n < static_cast<size_t>(fps * 1.5)) return std::nullopt;
-
     std::vector<float> f(n, 0.0f);
     float prev = 0.0f;
     for (size_t i = 0; i < n; ++i) {
@@ -121,7 +115,7 @@ std::optional<double> detect_bpm(const std::vector<float>& x, double rate, doubl
         f[i] = i ? std::max(0.0f, l - prev) : 0.0f;
         prev = l;
     }
-    const size_t w = static_cast<size_t>(fps * 0.5);
+    const size_t w = std::max<size_t>(1, static_cast<size_t>(fps * 0.5));
     std::vector<float> g(n);
     double run = 0.0;
     for (size_t i = 0; i < n; ++i) {
@@ -129,6 +123,21 @@ std::optional<double> detect_bpm(const std::vector<float>& x, double rate, doubl
         if (i >= w) run -= f[i - w];
         g[i] = std::max(0.0f, f[i] - static_cast<float>(run / static_cast<double>(std::min(i + 1, w))));
     }
+
+    return g;
+}
+
+// Onset envelope = log RMS of the first difference per 2.5 ms hop; autocorrelated over 60..200 BPM
+// with a mild prior around 120 BPM (octave errors are the usual failure: halve/double by hand).
+std::optional<double> detect_bpm(const std::vector<float>& x, double rate, double& beats_out)
+{
+    beats_out = 0.0;
+    const size_t hop = static_cast<size_t>(std::max(1.0, rate / 400.0));
+    const double fps = rate / static_cast<double>(hop);
+    const size_t n = x.size() / hop;
+    if (n < static_cast<size_t>(fps * 1.5)) return std::nullopt;
+
+    const auto g = onset_curve(x, hop, fps);
 
     const size_t lmin = static_cast<size_t>(60.0 * fps / 200.0), lmax = static_cast<size_t>(std::ceil(60.0 * fps / 60.0));
     if (lmax + 2 >= n) return std::nullopt;
@@ -363,6 +372,359 @@ bool AlphaSamplerAudioProcessor::loadUserPreset(const juce::File& f)
         file_settings_ = keep_fs;
     }
     return true;
+}
+
+
+// ---- slices -----------------------------------------------------------------
+std::vector<float> AlphaSamplerAudioProcessor::slices() const
+{
+    std::vector<float> v;
+    for (int i = 0, n = slice_n_.load(); i < n; ++i) v.push_back(slice_pos_[static_cast<size_t>(i)].load());
+    return v;
+}
+
+void AlphaSamplerAudioProcessor::setSlices(std::vector<float> v)
+{
+    for (float& f : v) f = std::clamp(f, 0.0f, 0.9999f);
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end(), [](float a, float b) { return b - a < 1.0e-4f; }), v.end());
+    if (v.size() > static_cast<size_t>(MAX_SLICES)) v.resize(MAX_SLICES);
+    slice_n_.store(0);
+    for (size_t i = 0; i < v.size(); ++i) slice_pos_[i].store(v[i]);
+    slice_n_.store(static_cast<int>(v.size()));
+}
+
+int AlphaSamplerAudioProcessor::slice_index(int note) const
+{
+    if (!slice_on->get()) return -1;
+    const int i = note - slice_base->getIndex();
+    return i >= 0 && i < slice_n_.load() ? i : -1;
+}
+
+void AlphaSamplerAudioProcessor::trigger(uint8_t note, float vel, const Block& b, int at)
+{
+    const int idx = slice_index(note);
+    if (idx < 0) { engine_.note_on(note, vel, b); return; }
+
+    const int n = slice_n_.load();
+    const double s = slice_pos_[static_cast<size_t>(idx)].load();
+    const double e = idx + 1 < n ? static_cast<double>(slice_pos_[static_cast<size_t>(idx) + 1].load()) : 1.0;
+    Block sb = b;
+    sb.root = note;
+    sb.add_key = false;
+    sb.loop_on = false;
+    sb.start_offset = s;
+    sb.zone = { 0, 131 };
+    for (int i = 0; i < noff_; ++i)
+        if (offs_[static_cast<size_t>(i)].key == note) offs_[static_cast<size_t>(i)] = offs_[static_cast<size_t>(--noff_)], --i;
+    engine_.note_on(note, vel, sb);
+
+    // The slice is a one-shot: a note-off is scheduled at its end (length scaled like Engine::note_on does).
+    const double rate = static_cast<double>(rate_.load());
+    const double total = static_cast<double>(frames->load()) / rate;
+    const double lr = sb.ts_time ? *sb.ts_time / std::max(total, 1.0e-6) : sb.ts_ratio;
+    const double secs = (e - s) * total * std::clamp(lr, 0.0625, 16.0) / std::exp2(sb.cents / 1200.0);
+    if (noff_ < static_cast<int>(offs_.size()))
+        offs_[static_cast<size_t>(noff_++)] = { clock_ + static_cast<uint64_t>(std::max(0, at)) + static_cast<uint64_t>(std::max(0.001, secs) * rate), note };
+}
+
+void AlphaSamplerAudioProcessor::autoSlice(int kind, int arg)
+{
+    if (kind == 0) {
+        std::vector<float> v;
+        for (int i = 0; i < std::clamp(arg, 1, MAX_SLICES); ++i) v.push_back(static_cast<float>(i) / static_cast<float>(arg));
+        setSlices(std::move(v));
+        return;
+    }
+    if (kind == 2) {
+        const float beats = beats_found.load();
+        if (beats < 1.0f) { setStatus("run DETECT TEMPO first"); return; }
+        std::vector<float> v;
+        const int n = std::min(MAX_SLICES, static_cast<int>(std::round(beats)));
+        for (int i = 0; i < n; ++i) v.push_back(static_cast<float>(i) / static_cast<float>(n));
+        setSlices(std::move(v));
+        return;
+    }
+    runJob([this, arg] {
+        juce::AudioBuffer<float> b;
+        double rate = 0.0;
+        if (!processed_buffer(b, rate) || b.getNumSamples() < 2048) { setStatus("nothing to slice"); return; }
+        std::vector<float> mono(static_cast<size_t>(b.getNumSamples()));
+        for (int i = 0; i < b.getNumSamples(); ++i) {
+            float s = 0.0f;
+            for (int c = 0; c < b.getNumChannels(); ++c) s += b.getSample(c, i);
+            mono[static_cast<size_t>(i)] = s / static_cast<float>(b.getNumChannels());
+        }
+        const size_t hop = static_cast<size_t>(std::max(1.0, rate / 400.0));
+        const double fps = rate / static_cast<double>(hop);
+        const auto g = onset_curve(mono, hop, fps);
+        double mean = 0.0, var = 0.0;
+        for (float x : g) mean += x;
+        mean /= static_cast<double>(std::max<size_t>(1, g.size()));
+        for (float x : g) var += (x - mean) * (x - mean);
+        const double sd = std::sqrt(var / static_cast<double>(std::max<size_t>(1, g.size())));
+        const double thr = mean + sd * (3.0 - 2.5 * std::clamp(arg, 0, 100) / 100.0);
+        const size_t gap = static_cast<size_t>(fps * 0.06);
+        std::vector<float> v { 0.0f };
+        size_t last = 0;
+        for (size_t i = 2; i + 2 < g.size(); ++i)
+            if (g[i] > thr && g[i] >= g[i - 1] && g[i] >= g[i + 1] && i - last > gap) {
+                v.push_back(static_cast<float>(static_cast<double>(i) / static_cast<double>(g.size())));
+                last = i;
+            }
+        setSlices(std::move(v));
+        setStatus(juce::String(slice_n_.load()) + " slices");
+    });
+}
+
+// ---- jobs / status ------------------------------------------------------------
+juce::String AlphaSamplerAudioProcessor::statusText() const { const std::lock_guard<std::mutex> lk(status_lock_); return status_; }
+void AlphaSamplerAudioProcessor::setStatus(const juce::String& s) { const std::lock_guard<std::mutex> lk(status_lock_); status_ = s; }
+
+std::optional<std::pair<juce::File, bool>> AlphaSamplerAudioProcessor::takeLoadRequest()
+{
+    const std::lock_guard<std::mutex> lk(status_lock_);
+    auto r = std::move(load_request_);
+    load_request_.reset();
+    return r;
+}
+
+juce::File AlphaSamplerAudioProcessor::dataDir() const
+{
+    return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile("Alpha Sampler");
+}
+
+namespace {
+bool write_wav(const juce::File& f, const juce::AudioBuffer<float>& b, double rate)
+{
+    if (b.getNumSamples() <= 0) return false;
+    f.getParentDirectory().createDirectory();
+    f.deleteFile();
+    std::unique_ptr<juce::OutputStream> os = std::make_unique<juce::FileOutputStream>(f);
+    if (static_cast<juce::FileOutputStream*>(os.get())->failedToOpen()) return false;
+    juce::WavAudioFormat fmt;
+    auto w = fmt.createWriterFor(os, juce::AudioFormatWriterOptions {}.withSampleRate(rate).withNumChannels(b.getNumChannels()).withBitsPerSample(24));
+    return w && w->writeFromAudioSampleBuffer(b, 0, b.getNumSamples());
+}
+} // namespace
+
+// Processed sample as the voices play it at their root note (disk-streamed samples are read from the file).
+bool AlphaSamplerAudioProcessor::processed_buffer(juce::AudioBuffer<float>& out, double& rate)
+{
+    std::shared_ptr<const Processed> p;
+    std::string path;
+    { const std::lock_guard<std::mutex> lk(state_lock_); p = processed_; path = loaded_path_; }
+    if (p && p->sample && !p->sample->empty()) {
+        const auto& s = *p->sample;
+        const bool st = s.right.size() == s.left.size();
+        out.setSize(2, s.frames());
+        out.copyFrom(0, 0, s.left.data(), s.frames());
+        out.copyFrom(1, 0, st ? s.right.data() : s.left.data(), s.frames());
+        rate = static_cast<double>(s.rate);
+        return true;
+    }
+    std::unique_ptr<juce::AudioFormatReader> r(path.empty() ? nullptr : library_.formats().createReaderFor(juce::File(path)));
+    if (!r || r->lengthInSamples <= 0) return false;
+    const int n = static_cast<int>(r->lengthInSamples);
+    juce::AudioBuffer<float> tmp(2, n);
+    r->read(&tmp, 0, n, 0, true, true);
+    if (r->numChannels < 2) tmp.copyFrom(1, 0, tmp, 0, 0, n);
+    out = std::move(tmp);
+    rate = r->sampleRate;
+    return true;
+}
+
+// Plays the sample through a private engine at its root note (envelopes, filter, loop, stretch included).
+void AlphaSamplerAudioProcessor::render_note(const juce::AudioBuffer<float>& src, double rate, juce::AudioBuffer<float>& out)
+{
+    std::shared_ptr<const Processed> p;
+    { const std::lock_guard<std::mutex> lk(state_lock_); p = processed_; }
+    auto smp = std::make_shared<Sample>();
+    smp->rate = static_cast<uint32_t>(std::lround(rate));
+    smp->left.assign(src.getReadPointer(0), src.getReadPointer(0) + src.getNumSamples());
+    smp->right.assign(src.getReadPointer(1), src.getReadPointer(1) + src.getNumSamples());
+
+    Engine eng(static_cast<float>(rate));
+    eng.set_quality(1);
+    eng.set_wait(true);
+    eng.set_sample(smp);
+    eng.set_looped(p ? p->looped : std::nullopt);
+    Block blk = make_block(tempo_value(), 0.0);
+    blk.zone = { 0, 131 };
+    const uint8_t key = static_cast<uint8_t>(blk.root);
+    const double secs = static_cast<double>(src.getNumSamples()) / rate;
+    const double hold = (p && p->looped && blk.loop_on) ? 4.0 : secs * (blk.ts_time ? *blk.ts_time / secs : blk.ts_ratio);
+    const int hold_n = static_cast<int>(std::min(hold, 120.0) * rate), max_n = hold_n + static_cast<int>(30.0 * rate);
+    out.setSize(2, max_n);
+    out.clear();
+    eng.note_on(key, 1.0f, blk);
+    int pos = 0;
+    bool released = false;
+    while (pos < max_n) {
+        if (!released && pos >= hold_n) { eng.note_off(key, blk); released = true; }
+        const int len = std::min(512, (released ? max_n : hold_n) - pos);
+        if (len <= 0) break;
+        eng.render(out.getWritePointer(0) + pos, out.getWritePointer(1) + pos, len, blk);
+        pos += len;
+        if (released && !eng.has_voices()) break;
+    }
+    int end = pos;
+    while (end > 1 && std::max(std::abs(out.getSample(0, end - 1)), std::abs(out.getSample(1, end - 1))) < 3.0e-5f) --end;
+    out.setSize(2, std::max(1, end), true);
+}
+
+void AlphaSamplerAudioProcessor::exportAudio(const juce::File& dest, int mode, bool load_after)
+{
+    setStatus("rendering...");
+    runJob([this, dest, mode, load_after] {
+        juce::AudioBuffer<float> b;
+        double rate = 0.0;
+        if (!processed_buffer(b, rate)) { setStatus("nothing to render"); return; }
+        if (mode == 2) {
+            const auto sl = slices();
+            if (sl.empty()) { setStatus("no slices"); return; }
+            dest.createDirectory();
+            const auto base = juce::File(sample_path_).getFileNameWithoutExtension();
+            int ok = 0;
+            for (size_t i = 0; i < sl.size(); ++i) {
+                const int a = static_cast<int>(sl[i] * static_cast<float>(b.getNumSamples()));
+                const int z = i + 1 < sl.size() ? static_cast<int>(sl[i + 1] * static_cast<float>(b.getNumSamples())) : b.getNumSamples();
+                if (z - a < 2) continue;
+                juce::AudioBuffer<float> part(2, z - a);
+                for (int c = 0; c < 2; ++c) part.copyFrom(c, 0, b, c, a, z - a);
+                part.applyGainRamp(std::max(0, z - a - 64), 64, 1.0f, 0.0f);
+                ok += write_wav(dest.getChildFile(base + "_slice_" + juce::String(static_cast<int>(i) + 1).paddedLeft('0', 2) + ".wav"), part, rate) ? 1 : 0;
+            }
+            setStatus("exported " + juce::String(ok) + " slices");
+            return;
+        }
+        if (mode == 1) { juce::AudioBuffer<float> o; render_note(b, rate, o); b = std::move(o); }
+        if (!write_wav(dest, b, rate)) { setStatus("write failed: " + dest.getFileName()); return; }
+        setStatus("saved " + dest.getFileName());
+        if (load_after) { const std::lock_guard<std::mutex> lk(status_lock_); load_request_ = { dest, true }; }
+    });
+}
+
+// ---- scripts ------------------------------------------------------------------
+// Contract: <python> script.py <in.wav> <out.wav> rate=<Hz> bpm=<host> root=<note>
+// in.wav is a 24-bit WAV copy of the loaded file (the original is never modified); out.wav is swapped in on exit code 0.
+void AlphaSamplerAudioProcessor::runScript(const juce::File& script)
+{
+    std::string path;
+    { const std::lock_guard<std::mutex> lk(state_lock_); path = loaded_path_; }
+    if (path.empty()) { setStatus("load a sample first"); return; }
+    setStatus("running " + script.getFileName() + "...");
+    const juce::File in(path);
+    const auto py = python_path_;
+    const double bpm = tempo_value();
+    const int rt = root->getIndex();
+    runJob([this, script, in, py, bpm, rt] {
+        const auto tmp_in = dataDir().getChildFile("Edits").getChildFile("_script_input.wav");
+        {
+            std::unique_ptr<juce::AudioFormatReader> r(library_.formats().createReaderFor(in));
+            if (!r || r->lengthInSamples <= 0) { setStatus("cannot read " + in.getFileName()); return; }
+            const int n = static_cast<int>(r->lengthInSamples);
+            juce::AudioBuffer<float> b(2, n);
+            r->read(&b, 0, n, 0, true, true);
+            if (r->numChannels < 2) b.copyFrom(1, 0, b, 0, 0, n);
+            if (!write_wav(tmp_in, b, r->sampleRate)) { setStatus("cannot write script input"); return; }
+        }
+        const auto out = dataDir().getChildFile("Edits").getChildFile(in.getFileNameWithoutExtension() + "_" + script.getFileNameWithoutExtension() + ".wav").getNonexistentSibling();
+        out.getParentDirectory().createDirectory();
+        juce::StringArray tail { script.getFullPathName(), tmp_in.getFullPathName(), out.getFullPathName(),
+                                 "rate=" + juce::String(rate_.load()), "bpm=" + juce::String(bpm, 3), "root=" + juce::String(rt) };
+        std::vector<juce::StringArray> cands;
+        if (py.isNotEmpty()) cands.push_back({ py });
+        else { cands.push_back({ "py", "-3" }); cands.push_back({ "python" }); cands.push_back({ "python3" }); }
+        juce::String log;
+        for (auto head : cands) {
+            head.addArray(tail);
+            juce::ChildProcess proc;
+            if (!proc.start(head)) continue;
+            const bool done = proc.waitForProcessToFinish(120000);
+            log = proc.readAllProcessOutput().trim();
+            if (!done) { setStatus("script timed out"); return; }
+            if (proc.getExitCode() == 0 && out.existsAsFile()) {
+                setStatus("script ok -> " + out.getFileName());
+                const std::lock_guard<std::mutex> lk(status_lock_);
+                load_request_ = { out, true };
+                return;
+            }
+            if (log.containsIgnoreCase("Python was not found") || log.isEmpty()) continue;
+            break;
+        }
+        setStatus("script failed: " + (log.isEmpty() ? juce::String("no python found (set PYTHON path)") : log.substring(std::max(0, log.length() - 160))));
+    });
+}
+
+void AlphaSamplerAudioProcessor::loadEdited(const juce::File& f)
+{
+    if (origin_path_.isEmpty()) origin_path_ = sample_path_;
+    const auto keep = origin_path_;
+    loadFile(f, true);
+    origin_path_ = keep;
+}
+
+void AlphaSamplerAudioProcessor::revertEdit()
+{
+    if (origin_path_.isEmpty()) return;
+    const juce::File o(origin_path_);
+    if (!o.existsAsFile()) { setStatus("original not found"); return; }
+    loadFile(o, true);
+    origin_path_.clear();
+}
+
+// ---- recording ------------------------------------------------------------------
+void AlphaSamplerAudioProcessor::startRecording(int source)
+{
+    if (rec_on_.load()) return;
+    rec_rate_ = rate_.load();
+    const size_t cap = static_cast<size_t>(rec_rate_) * 120u;
+    rec_l_.assign(cap, 0.0f);
+    rec_r_.assign(cap, 0.0f);
+    rec_n_.store(0);
+    rec_peak_.store(0.0f);
+    rec_src_ = source;
+    rec_on_.store(true, std::memory_order_release);
+}
+
+void AlphaSamplerAudioProcessor::record(const float* l, const float* r, int n) noexcept
+{
+    const size_t at = rec_n_.load(std::memory_order_relaxed);
+    const size_t len = std::min(static_cast<size_t>(n), rec_l_.size() - at);
+    float pk = rec_peak_.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < len; ++i) {
+        const float a = l ? l[i] : 0.0f, b = r ? r[i] : 0.0f;
+        rec_l_[at + i] = a;
+        rec_r_[at + i] = b;
+        pk = std::max({ pk, std::abs(a), std::abs(b) });
+    }
+    rec_peak_.store(pk, std::memory_order_relaxed);
+    rec_n_.store(at + len, std::memory_order_release);
+    if (at + len >= rec_l_.size()) rec_on_.store(false, std::memory_order_release);
+}
+
+void AlphaSamplerAudioProcessor::stopRecording()
+{
+    if (!rec_on_.exchange(false)) return;
+    juce::Thread::sleep(30);   // let an in-flight audio block finish writing
+    const size_t n = rec_n_.load(std::memory_order_acquire);
+    if (n < 64) { setStatus("nothing recorded"); return; }
+    const auto dest = dataDir().getChildFile("Recordings").getChildFile("rec_" + juce::Time::getCurrentTime().formatted("%Y%m%d_%H%M%S") + ".wav");
+    const bool silent = rec_peak_.load() < 1.0e-6f;
+    auto l = std::make_shared<std::vector<float>>(rec_l_.begin(), rec_l_.begin() + static_cast<std::ptrdiff_t>(n));
+    auto r = std::make_shared<std::vector<float>>(rec_r_.begin(), rec_r_.begin() + static_cast<std::ptrdiff_t>(n));
+    const double rate = rec_rate_;
+    setStatus("saving recording...");
+    runJob([this, dest, l, r, rate, silent] {
+        juce::AudioBuffer<float> b(2, static_cast<int>(l->size()));
+        b.copyFrom(0, 0, l->data(), b.getNumSamples());
+        b.copyFrom(1, 0, r->data(), b.getNumSamples());
+        if (!write_wav(dest, b, rate)) { setStatus("recording write failed"); return; }
+        setStatus(silent ? "recorded silence: is the input routed? (" + dest.getFileName() + ")" : "recorded " + dest.getFileName());
+        const std::lock_guard<std::mutex> lk(status_lock_);
+        load_request_ = { dest, false };
+    });
 }
 
 } // namespace as

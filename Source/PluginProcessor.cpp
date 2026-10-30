@@ -333,6 +333,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout AlphaSamplerAudioProcessor::
     fine = L.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{ "fine", 1 }, "Fine tuning", -100, 100, 0), false);
     main_pitch     = L.flag("main_pitch", "Affected by the main pitch", true);
     add_key        = L.flag("add_key", "Add root note to key", false);
+    slice_on       = L.flag("slice_on", "Slice mode (notes trigger slices)", false);
+    slice_base     = L.choice("slice_base", "First slice note", note_names(), 36);
 
     return std::move(L.layout);
 }
@@ -507,6 +509,13 @@ struct AlphaSamplerAudioProcessor::Worker final : juce::Thread
             const bool woke = event.wait(150);
             if (threadShouldExit()) break;
             owner.engine_.collect_garbage();
+
+            std::function<void()> job;
+            {
+                const std::lock_guard<std::mutex> jl(owner.jobs_lock_);
+                if (!owner.jobs_.empty()) { job = std::move(owner.jobs_.front()); owner.jobs_.erase(owner.jobs_.begin()); }
+            }
+            if (job) { try { job(); } catch (...) { owner.setStatus("job failed"); } event.signal(); continue; }
 
             bool load = false, clear = false;
             juce::File f;
@@ -851,7 +860,8 @@ struct AlphaSamplerAudioProcessor::HistListener final : juce::AudioProcessorPara
 };
 
 AlphaSamplerAudioProcessor::AlphaSamplerAudioProcessor()
-    : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+    : AudioProcessor(BusesProperties().withInput("Input", juce::AudioChannelSet::stereo(), false)
+                                    .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       frames(std::make_shared<std::atomic<uint32_t>>(0)),
       apvts_(*this, nullptr, "PARAMS", makeLayout()),
       engine_(44100.0f),
@@ -869,8 +879,9 @@ AlphaSamplerAudioProcessor::~AlphaSamplerAudioProcessor()
     for (auto* prm : getParameters()) prm->removeListener(hist_.get());
 }
 
-void AlphaSamplerAudioProcessor::loadFile(const juce::File& path)
+void AlphaSamplerAudioProcessor::loadFile(const juce::File& path, bool keep_slices)
 {
+    if (!keep_slices) { slice_n_.store(0); origin_path_.clear(); }
     sample_path_ = path.getFullPathName();
     file_settings_.clear();
     load_state.store(1);
@@ -884,8 +895,16 @@ void AlphaSamplerAudioProcessor::detectTempo()
     worker_->wake();
 }
 
+void AlphaSamplerAudioProcessor::runJob(std::function<void()> f)
+{
+    { const std::lock_guard<std::mutex> lk(jobs_lock_); jobs_.push_back(std::move(f)); }
+    worker_->wake();
+}
+
 void AlphaSamplerAudioProcessor::clearFile()
 {
+    slice_n_.store(0);
+    origin_path_.clear();
     sample_path_.clear();
     file_settings_.clear();
     worker_->enqueue_load({}, true);
@@ -916,7 +935,9 @@ void AlphaSamplerAudioProcessor::prepareToPlay(double sampleRate, int /*samplesP
 
 bool AlphaSamplerAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
-    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
+    const auto in = layouts.getMainInputChannelSet();
+    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()
+        && (in.isDisabled() || in == juce::AudioChannelSet::stereo());
 }
 
 void AlphaSamplerAudioProcessor::take(const Processed& p)
@@ -929,6 +950,12 @@ void AlphaSamplerAudioProcessor::take(const Processed& p)
 void AlphaSamplerAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ScopedNoDenormals noDenormals;
+    const int nIn = buffer.getNumSamples();
+    if (rec_on_.load(std::memory_order_acquire) && rec_src_ == 1) {
+        auto in = getBusBuffer(buffer, true, 0);
+        if (in.getNumChannels() > 0) record(in.getReadPointer(0), in.getReadPointer(in.getNumChannels() > 1 ? 1 : 0), nIn);
+        else record(nullptr, nullptr, nIn);
+    }
     buffer.clear();
 
     if (auto* ph = getPlayHead())
@@ -960,30 +987,47 @@ void AlphaSamplerAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, 
         std::unique_lock<std::mutex> lk(previews_lock_, std::try_to_lock);
         if (lk.owns_lock()) {
             for (auto [key, vel] : previews_) {
-                if (vel >= 0.0f) engine_.note_on(key, vel, blk);
-                else engine_.note_off(key, blk);
+                if (vel >= 0.0f) trigger(key, vel, blk, 0);
+                else if (slice_index(key) < 0) engine_.note_off(key, blk);
             }
             previews_.clear();
         }
     }
 
     int at = 0;
-    for (const auto meta : midi) {
-        const int t = juce::jlimit(0, n, meta.samplePosition);
+    auto advance = [&](int t) {
+        for (;;) {
+            int best = -1, bt = t;
+            for (int i = 0; i < noff_; ++i) {
+                const int rel = std::max(at, static_cast<int>(std::min<uint64_t>(offs_[static_cast<size_t>(i)].at > clock_ ? offs_[static_cast<size_t>(i)].at - clock_ : 0, 1u << 30)));
+                if (rel < bt) { bt = rel; best = i; }
+            }
+            if (best < 0) break;
+            if (bt > at) { engine_.render(left + at, right + at, bt - at, blk); at = bt; }
+            engine_.note_off(offs_[static_cast<size_t>(best)].key, blk);
+            offs_[static_cast<size_t>(best)] = offs_[static_cast<size_t>(--noff_)];
+        }
         if (t > at) { engine_.render(left + at, right + at, t - at, blk); at = t; }
+    };
+    for (const auto meta : midi) {
+        advance(juce::jlimit(0, n, meta.samplePosition));
         const auto msg = meta.getMessage();
         if (msg.isNoteOn()) {
-            engine_.note_on(static_cast<uint8_t>(msg.getNoteNumber()), msg.getFloatVelocity(), blk);
+            trigger(static_cast<uint8_t>(msg.getNoteNumber()), msg.getFloatVelocity(), blk, at);
         } else if (msg.isNoteOff()) {
-            engine_.note_off(static_cast<uint8_t>(msg.getNoteNumber()), blk);
+            if (slice_index(msg.getNoteNumber()) < 0) engine_.note_off(static_cast<uint8_t>(msg.getNoteNumber()), blk);
         } else if (msg.isAllNotesOff() || msg.isAllSoundOff()) {
             engine_.all_off();
+            noff_ = 0;
         } else if (msg.isPitchWheel()) {
             bend_ = (static_cast<double>(msg.getPitchWheelValue()) / 8192.0 - 1.0) * 200.0;
             blk = make_block(tempo_value(), bend_);
         }
     }
-    if (at < n) engine_.render(left + at, right + at, n - at, blk);
+    advance(n);
+    clock_ += static_cast<uint64_t>(n);
+    if (rec_on_.load(std::memory_order_acquire) && rec_src_ == 0)
+        record(buffer.getReadPointer(0), buffer.getReadPointer(buffer.getNumChannels() > 1 ? 1 : 0), n);
 
     meter_l.store(std::max(buffer.getMagnitude(0, 0, n), meter_l.load()));
     if (buffer.getNumChannels() > 1)
@@ -1002,6 +1046,13 @@ void AlphaSamplerAudioProcessor::getStateInformation(juce::MemoryBlock& destData
     state.setProperty("sample_path", sample_path_, nullptr);
     state.setProperty("file_settings", file_settings_, nullptr);
     state.setProperty("preset", preset_name_, nullptr);
+    state.setProperty("origin_path", origin_path_, nullptr);
+    state.setProperty("python_path", python_path_, nullptr);
+    {
+        juce::StringArray sl;
+        for (float s : slices()) sl.add(juce::String(s, 6));
+        state.setProperty("slices", sl.joinIntoString(","), nullptr);
+    }
     if (auto xml = state.createXml()) copyXmlToBinary(*xml, destData);
 }
 
@@ -1016,6 +1067,13 @@ void AlphaSamplerAudioProcessor::setStateInformation(const void* data, int sizeI
     sample_path_ = vt.getProperty("sample_path", "").toString();
     file_settings_ = vt.getProperty("file_settings", "").toString();
     preset_name_ = vt.getProperty("preset", "").toString();
+    origin_path_ = vt.getProperty("origin_path", "").toString();
+    python_path_ = vt.getProperty("python_path", "").toString();
+    {
+        std::vector<float> sl;
+        for (const auto& t : juce::StringArray::fromTokens(vt.getProperty("slices", "").toString(), ",", "")) sl.push_back(t.getFloatValue());
+        setSlices(std::move(sl));
+    }
     if (sample_path_.isNotEmpty()) {
         const juce::File f(sample_path_);
         if (f.existsAsFile()) load(f);   // synchronous so offline renders find the sample

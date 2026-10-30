@@ -1049,7 +1049,7 @@ public:
     void setFileSettings(const juce::String& s) { file_settings_ = s; }
 
     // Message-thread API (decoding happens on the worker thread).
-    void loadFile(const juce::File& path);
+    void loadFile(const juce::File& path, bool keep_slices = false);
     void clearFile();
     void preview(uint8_t key, float vel, bool on);
 
@@ -1065,6 +1065,32 @@ public:
     bool saveUserPreset(const juce::String& relName, bool with_sample);
     bool loadUserPreset(const juce::File& f);
     juce::String presetName() const { return preset_name_; }
+    // ---- slices: start markers (fractions of the processed sample), note = slice_base + index ----
+    static constexpr int MAX_SLICES = 64;
+    std::vector<float> slices() const;
+    void setSlices(std::vector<float> v);
+    void autoSlice(int kind, int arg);   // 0 equal parts, 1 transients (arg = sensitivity 0..100), 2 whole beats
+    int sliceBase() const { return slice_base->getIndex(); }
+
+    // ---- background jobs, export, scripts, recording ----
+    void runJob(std::function<void()> f);
+    juce::String statusText() const;
+    void setStatus(const juce::String& s);
+    void exportAudio(const juce::File& dest, int mode, bool load_after);   // 0 processed sample, 1 played note, 2 slices into folder dest
+    void runScript(const juce::File& script);
+    void revertEdit();
+    void loadEdited(const juce::File& f);
+    std::optional<std::pair<juce::File, bool>> takeLoadRequest();   // bool: result of an edit (original stays revertible)
+    juce::File dataDir() const;
+    juce::String pythonPath() const { return python_path_; }
+    void setPythonPath(const juce::String& s) { python_path_ = s; }
+    juce::String originPath() const { return origin_path_; }
+    void startRecording(int source);   // 0 own output, 1 input bus
+    void stopRecording();
+    bool recording() const { return rec_on_.load(); }
+    float recSeconds() const { return static_cast<float>(rec_n_.load()) / static_cast<float>(std::max<uint32_t>(1, rec_rate_)); }
+    float recPeak() const { return rec_peak_.load(); }
+
     void detectTempo();
     void fitToHost();
     double hostTempo() const { return tempo_value(); }
@@ -1146,11 +1172,35 @@ private:
     juce::AudioParameterInt* fine = nullptr;
     juce::AudioParameterBool* main_pitch = nullptr;
     juce::AudioParameterBool* add_key = nullptr;
+    juce::AudioParameterBool* slice_on = nullptr;
+    juce::AudioParameterChoice* slice_base = nullptr;
     std::vector<juce::RangedAudioParameter*> signature_params_;
 
     juce::String file_settings_;
     juce::String sample_path_;
-    juce::String preset_name_;
+    juce::String preset_name_, origin_path_, python_path_;
+    std::array<std::atomic<float>, MAX_SLICES> slice_pos_ {};
+    std::atomic<int> slice_n_ { 0 };
+    struct Off { uint64_t at; uint8_t key; };
+    std::array<Off, 64> offs_ {};
+    int noff_ = 0;
+    uint64_t clock_ = 0;
+    std::mutex jobs_lock_;
+    std::vector<std::function<void()>> jobs_;
+    mutable std::mutex status_lock_;
+    juce::String status_;
+    std::optional<std::pair<juce::File, bool>> load_request_;
+    std::vector<float> rec_l_, rec_r_;
+    std::atomic<size_t> rec_n_ { 0 };
+    std::atomic<bool> rec_on_ { false };
+    std::atomic<float> rec_peak_ { 0.0f };
+    int rec_src_ = 0;
+    uint32_t rec_rate_ = 44100;
+    bool processed_buffer(juce::AudioBuffer<float>& out, double& rate);
+    void trigger(uint8_t note, float vel, const Block& b, int at);
+    int slice_index(int note) const;
+    void record(const float* l, const float* r, int n) noexcept;
+    void render_note(const juce::AudioBuffer<float>& src, double rate, juce::AudioBuffer<float>& out);
     std::atomic<int64_t> sample_mtime_ { 0 };
     std::atomic<bool> tempo_req_ { false };
     void resetParams();

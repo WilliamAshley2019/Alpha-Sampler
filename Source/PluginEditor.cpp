@@ -697,6 +697,8 @@ int WaveformView::markerAt (float x) const
     float bd = 6.0f;
     auto test = [&] (int id, float f) { const float d = std::abs (toX (f, a) - x); if (d < bd) { bd = d; best = id; } };
     test (0, norm ("start_offset"));
+    if (proc != nullptr)
+        for (size_t i = 0; i < proc->slices().size(); ++i) test (100 + (int) i, proc->slices()[i]);
     if (wave->loop_a >= 0.0 && wave->loop_b > wave->loop_a && norm ("loop_use") > 0.5f)
     {
         test (1, (float) wave->loop_a);
@@ -727,6 +729,26 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
         }
     drag = markerAt (e.position.x);
     panAnchor = z0;
+    if (proc != nullptr && wave != nullptr && mode != Spectrum && tweak == nullptr)
+    {
+        if (drag >= 100 && e.mods.isPopupMenu())
+        {
+            auto v = proc->slices();
+            v.erase (v.begin() + (drag - 100));
+            proc->setSlices (v);
+            drag = -1;
+            repaint();
+            return;
+        }
+        if (drag < 0 && e.mods.isShiftDown())
+        {
+            auto v = proc->slices();
+            v.push_back (toFrac (e.position.x));
+            proc->setSlices (v);
+            repaint();
+            return;
+        }
+    }
     if (drag == 0) setNorm ("start_offset", toFrac (e.position.x), true, false);
     else if (drag == 1) setNorm ("loop_start", toFrac (e.position.x), true, false);
     else if (drag == 2) setNorm ("loop_end", toFrac (e.position.x), true, false);
@@ -737,6 +759,17 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
     if (drag == 0) setNorm ("start_offset", toFrac (e.position.x), false, false);
     else if (drag == 1) setNorm ("loop_start", juce::jmin (toFrac (e.position.x), norm ("loop_end") - 0.001f), false, false);
     else if (drag == 2) setNorm ("loop_end", juce::jmax (toFrac (e.position.x), norm ("loop_start") + 0.001f), false, false);
+    else if (drag >= 100 && proc != nullptr)
+    {
+        auto v = proc->slices();
+        const size_t i = (size_t) (drag - 100);
+        if (i < v.size())
+        {
+            v[i] = juce::jlimit (i > 0 ? v[i - 1] + 0.001f : 0.0f, i + 1 < v.size() ? v[i + 1] - 0.001f : 0.9999f, toFrac (e.position.x));
+            proc->setSlices (v);
+            repaint();
+        }
+    }
     else if (z1 - z0 < 0.999f && mode != Spectrum)
     {
         const float span = z1 - z0;
@@ -1011,6 +1044,24 @@ void WaveformView::paintIdle (juce::Graphics& g, juce::Rectangle<float> area, ju
         g.drawVerticalLine ((int) x, area.getY(), area.getBottom());
         g.setFont (caps (9.f));
         g.drawText ("START", juce::Rectangle<float> (x + 3.f, area.getY(), 60.f, 12.f), juce::Justification::centredLeft, false);
+    }
+    if (proc != nullptr)
+    {
+        const auto sl = proc->slices();
+        const bool on = norm ("slice_on") > 0.5f;
+        g.saveState();
+        g.reduceClipRegion (area.toNearestInt());
+        g.setFont (caps (9.f));
+        for (size_t i = 0; i < sl.size(); ++i)
+        {
+            const float x = toX (sl[i], area);
+            g.setColour (col::offDyn.withAlpha (on ? 0.95f : 0.5f));
+            g.drawVerticalLine ((int) x, area.getY(), area.getBottom());
+            g.fillRect (x - 3.f, area.getY(), 7.f, 3.f);
+            g.drawText (juce::String ((int) i + 1) + (on ? juce::String (" ") + juce::String (laws::note_name (proc->sliceBase() + (int) i)) : juce::String()),
+                        juce::Rectangle<float> (x + 3.f, area.getBottom() - 24.f, 60.f, 12.f), juce::Justification::centredLeft, false);
+        }
+        g.restoreState();
     }
     if (z1 - z0 < 0.999f)
     {
@@ -1836,32 +1887,75 @@ void FilterPage::resized()
     placeGrid (a.removeFromTop (60), 2, 60, { &type, nullptr });
 }
 
-MiscPage::MiscPage (juce::AudioProcessorValueTreeState& ap)
+MiscPage::MiscPage (AlphaSamplerAudioProcessor& pr) : proc (pr)
 {
+    auto& ap = pr.apvts();
     root.attach (ap, "root", "ROOT NOTE");
     zoneLo.attach (ap, "zone_lo", "ZONE LOW");
     zoneHi.attach (ap, "zone_hi", "ZONE HIGH");
+    sliceBase.attach (ap, "slice_base", "FIRST SLICE NOTE");
+    sliceOn.attach (ap, "slice_on", "Slice mode (notes play slices)");
     fineLabel.setText ("FINE TUNE (cents)", juce::dontSendNotification);
     fineLabel.setFont (pt::ui::caps (9.5f));
     fineLabel.setColour (juce::Label::textColourId, pt::ui::col::textDim);
+    sliceInfo.setFont (pt::ui::sans (11.f));
+    sliceInfo.setColour (juce::Label::textColourId, pt::ui::col::textDim);
     fine.setSliderStyle (juce::Slider::LinearHorizontal);
     fine.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
     fineAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (ap, "fine", fine);
     mainPitch.attach (ap, "main_pitch", "Pitch bend applies");
     addKey.attach (ap, "add_key", "Add root note to key");
-    for (juce::Component* c : std::initializer_list<juce::Component*> { &root, &zoneLo, &zoneHi, &fineLabel, &fine, &mainPitch, &addKey })
+
+    equalBtn.onClick = [this]
+    {
+        juce::PopupMenu m;
+        for (int n : { 2, 4, 8, 16, 32, 64 }) m.addItem (n, juce::String (n) + " equal slices");
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&equalBtn), [this] (int r) { if (r > 0) proc.autoSlice (0, r); });
+    };
+    transBtn.onClick = [this]
+    {
+        juce::PopupMenu m;
+        m.addItem (30, "Low sensitivity");
+        m.addItem (60, "Medium sensitivity");
+        m.addItem (90, "High sensitivity");
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&transBtn), [this] (int r) { if (r > 0) proc.autoSlice (1, r); });
+    };
+    beatBtn.onClick = [this] { proc.autoSlice (2, 0); };
+    clearBtn.onClick = [this] { proc.setSlices ({}); };
+    exportBtn.onClick = [this]
+    {
+        chooser = std::make_unique<juce::FileChooser> ("Folder for slice files", proc.dataDir().getChildFile ("Slices"));
+        chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                              [this] (const juce::FileChooser& fc) { if (fc.getResult() != juce::File()) proc.exportAudio (fc.getResult(), 2, false); });
+    };
+    for (juce::Component* c : std::initializer_list<juce::Component*> { &root, &zoneLo, &zoneHi, &sliceBase, &sliceOn, &fineLabel, &fine, &mainPitch, &addKey,
+                                                                        &equalBtn, &transBtn, &beatBtn, &clearBtn, &exportBtn, &sliceInfo })
         addAndMakeVisible (c);
+}
+
+void MiscPage::tick()
+{
+    const auto n = (int) proc.slices().size();
+    const auto t = n == 0 ? juce::String ("no slices - Shift+click the waveform to add one, right-click a marker to remove it")
+                          : juce::String (n) + " slices: notes " + juce::String (laws::note_name (proc.sliceBase())) + " to "
+                              + juce::String (laws::note_name (proc.sliceBase() + n - 1));
+    if (sliceInfo.getText() != t) sliceInfo.setText (t, juce::dontSendNotification);
 }
 
 void MiscPage::resized()
 {
     auto a = getLocalBounds().reduced (12);
     placeGrid (a.removeFromTop (60), 3, 60, { &root, &zoneLo, &zoneHi });
-    a.removeFromTop (12);
+    a.removeFromTop (8);
     fineLabel.setBounds (a.removeFromTop (16));
     fine.setBounds (a.removeFromTop (28));
-    a.removeFromTop (12);
+    a.removeFromTop (8);
     placeGrid (a.removeFromTop (34), 3, 34, { &mainPitch, &addKey, nullptr });
+    a.removeFromTop (10);
+    placeGrid (a.removeFromTop (60), 3, 60, { &sliceBase, nullptr, nullptr });
+    sliceOn.setBounds (a.removeFromTop (30).withWidth (260));
+    placeGrid (a.removeFromTop (34), 5, 34, { &equalBtn, &transBtn, &beatBtn, &clearBtn, &exportBtn });
+    sliceInfo.setBounds (a.removeFromTop (24));
 }
 
 EnvelopePage::EnvelopePage (juce::AudioProcessorValueTreeState& ap, const juce::String& p)
@@ -1916,11 +2010,172 @@ EnvTab::EnvTab (juce::AudioProcessorValueTreeState& ap)
 EnvTab::~EnvTab() = default;
 void EnvTab::resized() { tabs.setBounds (getLocalBounds()); }
 
+// ---- ToolsPage ---------------------------------------------------------------
+namespace
+{
+juce::String lastScript;
+const char* exampleScript =
+    "import sys, wave\n"
+    "src, dst = sys.argv[1], sys.argv[2]\n"
+    "opts = dict(a.split('=', 1) for a in sys.argv[3:] if '=' in a)   # rate, bpm, root\n"
+    "with wave.open(src, 'rb') as w:\n"
+    "    p = w.getparams()\n"
+    "    data = w.readframes(p.nframes)\n"
+    "fs = p.sampwidth * p.nchannels\n"
+    "frames = [data[i:i + fs] for i in range(0, len(data), fs)]\n"
+    "frames.reverse()   # edit here\n"
+    "with wave.open(dst, 'wb') as o:\n"
+    "    o.setparams(p)\n"
+    "    o.writeframes(b''.join(frames))\n";
+}
+
+ToolsPage::ToolsPage (AlphaSamplerAudioProcessor& p) : proc (p)
+{
+    if (lastScript.isNotEmpty()) script = juce::File (lastScript);
+    auto head = [this] (juce::Label& l, const char* t)
+    {
+        l.setText (t, juce::dontSendNotification);
+        l.setFont (pt::ui::caps (10.f));
+        l.setColour (juce::Label::textColourId, pt::ui::col::amber);
+        addAndMakeVisible (l);
+    };
+    head (h1, "RENDER TO FILE");
+    head (h2, "RECORD");
+    head (h3, "PYTHON SCRIPT");
+    for (auto* l : { &recLabel, &scriptLabel, &pyLabel, &statusLabel })
+    {
+        l->setFont (pt::ui::sans (12.f));
+        l->setColour (juce::Label::textColourId, pt::ui::col::textDim);
+        addAndMakeVisible (l);
+    }
+    source.addItemList ({ "Plugin output (always works)", "Input / sidechain bus" }, 1);
+    source.setSelectedId (1, juce::dontSendNotification);
+    loadAfter.setColour (juce::ToggleButton::textColourId, pt::ui::col::textDim);
+
+    renderBtn.onClick = [this] { saveAs (0); };
+    noteBtn.onClick = [this] { saveAs (1); };
+    recBtn.onClick = [this]
+    {
+        if (proc.recording()) proc.stopRecording();
+        else proc.startRecording (source.getSelectedId() - 1);
+    };
+    scriptBtn.onClick = [this] { scriptMenu(); };
+    runBtn.onClick = [this] { if (script.existsAsFile()) proc.runScript (script); else proc.setStatus ("choose a script first"); };
+    revertBtn.onClick = [this] { proc.revertEdit(); };
+    pyBtn.onClick = [this]
+    {
+        juce::PopupMenu m;
+        m.addItem (1, "Auto-detect (py -3, python, python3)");
+        m.addItem (2, "Browse for python.exe...");
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&pyBtn), [this] (int r)
+        {
+            if (r == 1) proc.setPythonPath ({});
+            if (r != 2) return;
+            chooser = std::make_unique<juce::FileChooser> ("Python executable", juce::File ("C:\\"), "*.exe;*");
+            chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                  [this] (const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) proc.setPythonPath (fc.getResult().getFullPathName()); });
+        });
+    };
+    for (juce::Component* c : std::initializer_list<juce::Component*> { &renderBtn, &noteBtn, &loadAfter, &recBtn, &source, &scriptBtn, &runBtn, &revertBtn, &pyBtn })
+        addAndMakeVisible (c);
+}
+
+void ToolsPage::saveAs (int mode)
+{
+    const auto base = juce::File (proc.samplePath()).getFileNameWithoutExtension();
+    chooser = std::make_unique<juce::FileChooser> ("Render to file", proc.dataDir().getChildFile ("Renders").getChildFile (base + (mode ? "_note.wav" : "_render.wav")), "*.wav");
+    chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting,
+                          [this, mode] (const juce::FileChooser& fc)
+                          {
+                              auto f = fc.getResult();
+                              if (f == juce::File()) return;
+                              proc.exportAudio (f.withFileExtension ("wav"), mode, loadAfter.getToggleState());
+                          });
+}
+
+void ToolsPage::scriptMenu()
+{
+    const auto dir = proc.dataDir().getChildFile ("Scripts");
+    dir.createDirectory();
+    auto files = dir.findChildFiles (juce::File::findFiles, false, "*.py");
+    if (files.isEmpty())
+    {
+        dir.getChildFile ("reverse_example.py").replaceWithText (exampleScript);
+        files = dir.findChildFiles (juce::File::findFiles, false, "*.py");
+    }
+    juce::PopupMenu m;
+    for (int i = 0; i < files.size(); ++i) m.addItem (i + 1, files[i].getFileName(), true, files[i] == script);
+    m.addSeparator();
+    m.addItem (-1, "Browse...");
+    m.addItem (-2, "Open scripts folder");
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&scriptBtn), [this, files, dir] (int r)
+    {
+        if (r > 0) { script = files[r - 1]; lastScript = script.getFullPathName(); }
+        else if (r == -2) dir.revealToUser();
+        else if (r == -1)
+        {
+            chooser = std::make_unique<juce::FileChooser> ("Python script", dir, "*.py");
+            chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                  [this] (const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) { script = fc.getResult(); lastScript = script.getFullPathName(); } });
+        }
+    });
+}
+
+void ToolsPage::tick()
+{
+    const bool rec = proc.recording();
+    recBtn.setButtonText (rec ? "STOP" : "REC");
+    recLabel.setText (rec ? juce::String (proc.recSeconds(), 1) + " s   peak " + juce::String (20.0f * std::log10 (juce::jmax (proc.recPeak(), 1.0e-6f)), 1) + " dB   (max 120 s)"
+                          : "Stopping saves a WAV in Documents/Alpha Sampler/Recordings and loads it as the sample.",
+                      juce::dontSendNotification);
+    scriptLabel.setText (script.getFileName().isEmpty() ? "no script" : script.getFileName()
+                             + (proc.originPath().isNotEmpty() ? "     edited - original: " + juce::File (proc.originPath()).getFileName() : juce::String()),
+                         juce::dontSendNotification);
+    pyLabel.setText ("python: " + (proc.pythonPath().isEmpty() ? juce::String ("auto") : proc.pythonPath()), juce::dontSendNotification);
+    statusLabel.setText (proc.statusText(), juce::dontSendNotification);
+    revertBtn.setEnabled (proc.originPath().isNotEmpty());
+}
+
+void ToolsPage::resized()
+{
+    auto a = getLocalBounds().reduced (12);
+    h1.setBounds (a.removeFromTop (18));
+    auto r = a.removeFromTop (30);
+    renderBtn.setBounds (r.removeFromLeft (150));
+    r.removeFromLeft (6);
+    noteBtn.setBounds (r.removeFromLeft (150));
+    r.removeFromLeft (14);
+    loadAfter.setBounds (r.removeFromLeft (220));
+    a.removeFromTop (18);
+    h2.setBounds (a.removeFromTop (18));
+    r = a.removeFromTop (30);
+    source.setBounds (r.removeFromLeft (230));
+    r.removeFromLeft (6);
+    recBtn.setBounds (r.removeFromLeft (80));
+    a.removeFromTop (4);
+    recLabel.setBounds (a.removeFromTop (22));
+    a.removeFromTop (14);
+    h3.setBounds (a.removeFromTop (18));
+    r = a.removeFromTop (30);
+    scriptBtn.setBounds (r.removeFromLeft (110));
+    r.removeFromLeft (6);
+    runBtn.setBounds (r.removeFromLeft (70));
+    r.removeFromLeft (6);
+    revertBtn.setBounds (r.removeFromLeft (80));
+    r.removeFromLeft (6);
+    pyBtn.setBounds (r.removeFromLeft (110));
+    a.removeFromTop (4);
+    scriptLabel.setBounds (a.removeFromTop (20));
+    pyLabel.setBounds (a.removeFromTop (20));
+    a.removeFromTop (8);
+    statusLabel.setBounds (a.removeFromTop (24));
+}
+
 // ---- the editor ---------------------------------------------------------------
 AlphaSamplerAudioProcessorEditor::AlphaSamplerAudioProcessorEditor (AlphaSamplerAudioProcessor& p)
     : AudioProcessorEditor (&p), processor (p),
       samplePage (p), loopPage (p.apvts()), stretchPage (p.apvts()), fxPage (p.apvts()),
-      filterPage (p.apvts()), miscPage (p.apvts()), envTab (p.apvts())
+      filterPage (p.apvts()), miscPage (p), toolsPage (p), envTab (p.apvts())
 {
     setLookAndFeel (&lookAndFeel);
 
@@ -1941,6 +2196,7 @@ AlphaSamplerAudioProcessorEditor::AlphaSamplerAudioProcessorEditor (AlphaSampler
     addAndMakeVisible (scope);
     addAndMakeVisible (presets);
     setWantsKeyboardFocus (true);
+    waveform.setProcessor (&processor);
     addAndMakeVisible (waveform);
     addAndMakeVisible (outMeter);
     addAndMakeVisible (peakMeter);
@@ -1952,6 +2208,7 @@ AlphaSamplerAudioProcessorEditor::AlphaSamplerAudioProcessorEditor (AlphaSampler
     tabs.addTab ("FX",      bg, &fxPage,      false);
     tabs.addTab ("FILTER",  bg, &filterPage,  false);
     tabs.addTab ("MISC",    bg, &miscPage,    false);
+    tabs.addTab ("TOOLS",   bg, &toolsPage,   false);
     tabs.addTab ("ENV",     bg, &envTab,      false);
     tabs.setOutline (0);
     addAndMakeVisible (tabs);
@@ -2063,6 +2320,13 @@ void AlphaSamplerAudioProcessorEditor::timerCallback()
     waveform.setTempo (processor.hostTempo());
     presets.refresh();
     samplePage.updateTempoLabel();
+    miscPage.tick();
+    toolsPage.tick();
+    if (auto req = processor.takeLoadRequest())
+    {
+        if (req->second) processor.loadEdited (req->first); else processor.loadFile (req->first);
+        samplePage.updateFileLabel();
+    }
     waveform.setBusy (processor.load_state.load() == 1);
 
     juce::String text;
