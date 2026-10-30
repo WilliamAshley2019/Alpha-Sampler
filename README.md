@@ -1,3 +1,9 @@
+Version 1.0.3
+Added a few more visual elements
+Added presets
+
+
+
 Version 1.0.1 (or is it 1.0.2) hmmm
 Ah it dawned on me anyone wanting to build might want to know it was made in JUCE 8.0.12 (I'm too lazy to update it seems to work fine for me currently)  built and tested in windows 11.  Using visual studio 2026 the source is a little picky probably won't build in v17 USE C++20   Add DSP with basics in the jucer and it should work, I might add the jucer later but nothing really crazy on this.
 Folders are just as they are appear  SOURCE  and third_party exactly as packaged. don't put third_party in source. 
