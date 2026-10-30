@@ -1,3 +1,12 @@
+Version 1.0.4
+Added slicing its in the MISC tab. 
+Added slice exports so samples can not be exported 
+
+render and RECORD Function etc.. HOWEVER USE A DIFFERENT INSTANCE OF ALPHA SAMPLER TO RECORD!!!!!!! it will overwrite your current sample loaded if your record in a used alpha sampler!!!! 
+TO DO ADD UNDO RECORD OVERWRITE 
+ADDED PYTHON  SCRIPTING THIS IS STILL EXPERIMENTAL!!!!!
+
+
 Version 1.0.3
 
 Added a few more visual elements
