@@ -515,6 +515,18 @@ struct AlphaSamplerAudioProcessor::Worker final : juce::Thread
                 if (clear) owner.clear(); else owner.load(f);
                 continue;
             }
+            if (owner.tempo_req_.exchange(false)) { owner.detect_tempo_now(); continue; }
+            if (++ticks % 7 == 0) {   // ~1 s: reload when the file changed on disk and has stopped changing
+                std::string lp;
+                { const std::lock_guard<std::mutex> lk(owner.state_lock_); lp = owner.loaded_path_; }
+                const auto known = owner.sample_mtime_.load();
+                if (!lp.empty() && known != 0) {
+                    const juce::File lf(lp);
+                    const auto now_ms = lf.getLastModificationTime().toMilliseconds();
+                    if (lf.existsAsFile() && now_ms != known && now_ms == last_seen) { owner.load(lf); continue; }
+                    last_seen = now_ms;
+                }
+            }
             if (woke) {
                 // Debounce knob drags: rebuild only once the parameters have settled.
                 auto s = owner.signature();
@@ -538,6 +550,8 @@ struct AlphaSamplerAudioProcessor::Worker final : juce::Thread
     juce::CriticalSection lock;
     juce::File pending;
     bool has_pending = false, pending_clear = false;
+    int ticks = 0;
+    int64_t last_seen = 0;
 };
 
 // ============================================================================
@@ -598,6 +612,36 @@ Peaks peaks_of_file(juce::AudioFormatManager& formats, const juce::File& path)
         }
     }
     return p;
+}
+
+Fetch fetch_of(const Sample& s)
+{
+    return [&s](size_t pos, size_t n, float* o) {
+        const bool st = s.right.size() == s.left.size();
+        for (size_t i = 0; i < n; ++i) {
+            const size_t k = pos + i;
+            o[i] = k >= s.left.size() ? 0.0f : (st ? 0.5f * (s.left[k] + s.right[k]) : s.left[k]);
+        }
+    };
+}
+
+std::shared_ptr<const Spectro> analyse_file(juce::AudioFormatManager& formats, const juce::File& path)
+{
+    std::shared_ptr<juce::AudioFormatReader> r(formats.createReaderFor(path));
+    if (!r || r->lengthInSamples <= 0) return nullptr;
+    juce::AudioBuffer<float> b(static_cast<int>(std::max<unsigned>(1, std::min<unsigned>(2, r->numChannels))), 2048);
+    auto fetch = [r, &b](size_t pos, size_t n, float* o) {
+        b.clear();
+        const auto avail = static_cast<size_t>(std::max<juce::int64>(0, r->lengthInSamples - static_cast<juce::int64>(pos)));
+        const int len = static_cast<int>(std::min(n, avail));
+        if (len > 0) r->read(&b, 0, len, static_cast<juce::int64>(pos), true, true);
+        for (size_t i = 0; i < n; ++i) {
+            float s = 0.0f;
+            for (int c = 0; c < b.getNumChannels(); ++c) s += b.getSample(c, static_cast<int>(i));
+            o[i] = s / static_cast<float>(b.getNumChannels());
+        }
+    };
+    return analyse(fetch, static_cast<size_t>(r->lengthInSamples), r->sampleRate);
 }
 } // namespace
 
@@ -706,6 +750,8 @@ void AlphaSamplerAudioProcessor::update_impl()
             {
                 auto w = std::make_shared<WaveView>();
                 w->raw = *raw_peaks_for(v, juce::File(path), raw.get());
+                if (!ana_cache_ || ana_version_ != v) { ana_cache_ = analyse_file(library_.formats(), juce::File(path)); ana_version_ = v; }
+                w->ana = ana_cache_;
                 w->proc = w->raw;
                 w->rate = static_cast<double>(lay->rate);
                 w->raw_frames = w->proc_frames = static_cast<double>(lay->frames);
@@ -734,6 +780,7 @@ void AlphaSamplerAudioProcessor::update_impl()
     auto wave = std::make_shared<WaveView>();
     wave->raw = *raw_peaks_for(v, juce::File(path), raw.get());
     wave->proc = peaks_of(built.sample);
+    wave->ana = analyse(fetch_of(built.sample), static_cast<size_t>(built.sample.frames()), static_cast<double>(built.sample.rate));
     wave->rate = static_cast<double>(built.sample.rate);
     wave->raw_frames = static_cast<double>(raw->frames());
     wave->proc_frames = static_cast<double>(built.sample.frames());
@@ -770,6 +817,7 @@ void AlphaSamplerAudioProcessor::load(const juce::File& path)
             loaded_path_ = path.getFullPathName().toStdString();
         }
         raw_version_.fetch_add(1);
+        sample_mtime_.store(path.getLastModificationTime().toMilliseconds());
         frames->store(s ? static_cast<uint32_t>(s->frames()) : 0);
         update_impl();
     }
@@ -785,6 +833,7 @@ void AlphaSamplerAudioProcessor::clear()
             raw_.reset(); source_ = {}; layout_.reset(); loaded_path_.clear();
         }
         raw_version_.fetch_add(1);
+        sample_mtime_.store(0);
         update_impl();
     }
     load_state.store(0);
@@ -793,6 +842,14 @@ void AlphaSamplerAudioProcessor::clear()
 // ============================================================================
 // Constructor / editor-facing API.
 // ============================================================================
+struct AlphaSamplerAudioProcessor::HistListener final : juce::AudioProcessorParameter::Listener
+{
+    explicit HistListener(AlphaSamplerAudioProcessor& o) : owner(o) {}
+    void parameterValueChanged(int, float) override {}
+    void parameterGestureChanged(int, bool starting) override { if (starting && !owner.hist_suspend_) owner.push_snapshot(); }
+    AlphaSamplerAudioProcessor& owner;
+};
+
 AlphaSamplerAudioProcessor::AlphaSamplerAudioProcessor()
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       frames(std::make_shared<std::atomic<uint32_t>>(0)),
@@ -801,12 +858,15 @@ AlphaSamplerAudioProcessor::AlphaSamplerAudioProcessor()
       worker_(std::make_unique<Worker>(*this))
 {
     previews_.reserve(256);
+    hist_ = std::make_unique<HistListener>(*this);
+    for (auto* prm : getParameters()) prm->addListener(hist_.get());
     worker_->startThread(juce::Thread::Priority::background);
 }
 
 AlphaSamplerAudioProcessor::~AlphaSamplerAudioProcessor()
 {
     worker_->stopThread(5000);
+    for (auto* prm : getParameters()) prm->removeListener(hist_.get());
 }
 
 void AlphaSamplerAudioProcessor::loadFile(const juce::File& path)
@@ -815,6 +875,13 @@ void AlphaSamplerAudioProcessor::loadFile(const juce::File& path)
     file_settings_.clear();
     load_state.store(1);
     worker_->enqueue_load(path, false);
+}
+
+void AlphaSamplerAudioProcessor::detectTempo()
+{
+    bpm_state.store(1);
+    tempo_req_.store(true);
+    worker_->wake();
 }
 
 void AlphaSamplerAudioProcessor::clearFile()
@@ -934,6 +1001,7 @@ void AlphaSamplerAudioProcessor::getStateInformation(juce::MemoryBlock& destData
     auto state = apvts_.copyState();
     state.setProperty("sample_path", sample_path_, nullptr);
     state.setProperty("file_settings", file_settings_, nullptr);
+    state.setProperty("preset", preset_name_, nullptr);
     if (auto xml = state.createXml()) copyXmlToBinary(*xml, destData);
 }
 
@@ -944,8 +1012,10 @@ void AlphaSamplerAudioProcessor::setStateInformation(const void* data, int sizeI
     const auto vt = juce::ValueTree::fromXml(*xml);
     if (!vt.isValid()) return;
     apvts_.replaceState(vt);
+    undo_stack_.clear(); redo_stack_.clear();
     sample_path_ = vt.getProperty("sample_path", "").toString();
     file_settings_ = vt.getProperty("file_settings", "").toString();
+    preset_name_ = vt.getProperty("preset", "").toString();
     if (sample_path_.isNotEmpty()) {
         const juce::File f(sample_path_);
         if (f.existsAsFile()) load(f);   // synchronous so offline renders find the sample

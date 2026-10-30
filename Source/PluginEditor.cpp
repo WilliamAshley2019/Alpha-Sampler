@@ -572,7 +572,8 @@ using GainFn = std::function<float (float)>;
 
 // Draws min/max peaks of [f0,f1] (fractions of the sample; f1 < f0 reverses) into r.
 void fillPeaks (juce::Graphics& g, const Peaks& pk, juce::Rectangle<float> r, float f0, float f1,
-                float gain, juce::Colour c, float fillAlpha, const GainFn& gfn = nullptr)
+                float gain, juce::Colour c, float fillAlpha, const GainFn& gfn = nullptr,
+                const std::function<juce::Colour (float)>& colourAt = nullptr)
 {
     if (pk.empty() || r.getWidth() < 2.0f) return;
     const int n = (int) pk.lo.size();
@@ -598,7 +599,13 @@ void fillPeaks (juce::Graphics& g, const Peaks& pk, juce::Rectangle<float> r, fl
         const float x = r.getX() + r.getWidth() * s;
         top.push_back ({ x, mid - a * amp });
         bot.push_back ({ x, mid - b * amp });
+        if (colourAt)
+        {
+            g.setColour (colourAt (s));
+            g.drawLine (x, mid - a * amp, x, mid - b * amp + 1.0f, 1.2f);
+        }
     }
+    if (colourAt) return;
     if (top.size() < 2) return;
     juce::Path p;
     p.startNewSubPath (top.front());
@@ -660,6 +667,115 @@ float WaveformView::val (const juce::String& id) const
     return q != nullptr ? q->convertFrom0to1 (q->getValue()) : 0.0f;
 }
 
+static float textWidth (const juce::String& t)
+{
+    juce::GlyphArrangement ga;
+    ga.addLineOfText (pt::ui::caps (9.f), t, 0.f, 0.f);
+    return ga.getBoundingBox (0, -1, true).getWidth();
+}
+
+juce::Rectangle<float> WaveformView::areaRect() const
+{
+    auto inner = getLocalBounds().toFloat().reduced (10.f, 6.f);
+    inner.removeFromTop (16.f);
+    return inner.reduced (0.f, 2.f);
+}
+
+float WaveformView::toFrac (float x) const
+{
+    const auto a = areaRect();
+    return z0 + (z1 - z0) * juce::jlimit (0.0f, 1.0f, (x - a.getX()) / a.getWidth());
+}
+
+float WaveformView::toX (float f, juce::Rectangle<float> a) const { return a.getX() + a.getWidth() * (f - z0) / (z1 - z0); }
+
+int WaveformView::markerAt (float x) const
+{
+    if (wave == nullptr || wave->proc.empty() || tweak != nullptr || mode == Spectrum) return -1;
+    const auto a = areaRect();
+    int best = -1;
+    float bd = 6.0f;
+    auto test = [&] (int id, float f) { const float d = std::abs (toX (f, a) - x); if (d < bd) { bd = d; best = id; } };
+    test (0, norm ("start_offset"));
+    if (wave->loop_a >= 0.0 && wave->loop_b > wave->loop_a && norm ("loop_use") > 0.5f)
+    {
+        test (1, (float) wave->loop_a);
+        test (2, (float) wave->loop_b);
+    }
+    return best;
+}
+
+void WaveformView::setNorm (const juce::String& id, float v, bool begin, bool end)
+{
+    if (auto* p = apvts.getParameter (id))
+    {
+        if (begin) p->beginChangeGesture();
+        p->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, v));
+        if (end) p->endChangeGesture();
+    }
+}
+
+void WaveformView::mouseDown (const juce::MouseEvent& e)
+{
+    for (auto& [r, id] : hits)
+        if (r.contains (e.position))
+        {
+            if (id < 4) { mode = id; repaint(); }
+            else if (id == 10) { showRaw = ! showRaw; repaint(); }
+            else if (id == 11) { grid = (grid + 1) % 3; repaint(); }
+            return;
+        }
+    drag = markerAt (e.position.x);
+    panAnchor = z0;
+    if (drag == 0) setNorm ("start_offset", toFrac (e.position.x), true, false);
+    else if (drag == 1) setNorm ("loop_start", toFrac (e.position.x), true, false);
+    else if (drag == 2) setNorm ("loop_end", toFrac (e.position.x), true, false);
+}
+
+void WaveformView::mouseDrag (const juce::MouseEvent& e)
+{
+    if (drag == 0) setNorm ("start_offset", toFrac (e.position.x), false, false);
+    else if (drag == 1) setNorm ("loop_start", juce::jmin (toFrac (e.position.x), norm ("loop_end") - 0.001f), false, false);
+    else if (drag == 2) setNorm ("loop_end", juce::jmax (toFrac (e.position.x), norm ("loop_start") + 0.001f), false, false);
+    else if (z1 - z0 < 0.999f && mode != Spectrum)
+    {
+        const float span = z1 - z0;
+        const float d = -(float) e.getDistanceFromDragStartX() / areaRect().getWidth() * span;
+        z0 = juce::jlimit (0.0f, 1.0f - span, panAnchor + d);
+        z1 = z0 + span;
+        repaint();
+    }
+}
+
+void WaveformView::mouseUp (const juce::MouseEvent&)
+{
+    if (drag == 0) setNorm ("start_offset", norm ("start_offset"), false, true);
+    else if (drag == 1) setNorm ("loop_start", norm ("loop_start"), false, true);
+    else if (drag == 2) setNorm ("loop_end", norm ("loop_end"), false, true);
+    drag = -1;
+}
+
+void WaveformView::mouseMove (const juce::MouseEvent& e)
+{
+    setMouseCursor (markerAt (e.position.x) >= 0 ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
+}
+
+void WaveformView::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    if (markerAt (e.position.x) < 0) { z0 = 0.0f; z1 = 1.0f; repaint(); }
+}
+
+void WaveformView::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
+{
+    if (mode == Spectrum) return;
+    const float at = toFrac (e.position.x), span = z1 - z0;
+    const float ns = juce::jlimit (0.002f, 1.0f, span * std::pow (0.8f, w.deltaY * 6.0f));
+    const float rel = (at - z0) / juce::jmax (1.0e-6f, span);
+    z0 = juce::jlimit (0.0f, 1.0f - ns, at - rel * ns);
+    z1 = z0 + ns;
+    repaint();
+}
+
 void WaveformView::paint (juce::Graphics& g)
 {
     const auto b = getLocalBounds().toFloat();
@@ -667,11 +783,15 @@ void WaveformView::paint (juce::Graphics& g)
 
     auto inner = b.reduced (10.f, 6.f);
     auto header = inner.removeFromTop (16.f);
-    auto area = inner.reduced (0.f, 2.f);
+    const auto area = areaRect();
 
+    if (grid == 0)
+    {
+        g.setColour (pt::ui::col::edgeLight.withAlpha (0.10f));
+        for (int i = 1; i < 10; ++i)
+            g.drawVerticalLine ((int) (area.getX() + area.getWidth() * (float) i / 10.f), area.getY(), area.getBottom());
+    }
     g.setColour (pt::ui::col::edgeLight.withAlpha (0.10f));
-    for (int i = 1; i < 10; ++i)
-        g.drawVerticalLine ((int) (area.getX() + area.getWidth() * (float) i / 10.f), area.getY(), area.getBottom());
     g.drawHorizontalLine ((int) area.getCentreY(), area.getX(), area.getRight());
 
     if (tweak != nullptr) paintTweak (g, area, header);
@@ -688,19 +808,111 @@ void WaveformView::paint (juce::Graphics& g)
     }
 }
 
+void WaveformView::paintGrid (juce::Graphics& g, juce::Rectangle<float> area)
+{
+    using namespace pt::ui;
+    if (grid == 0 || wave == nullptr || wave->rate <= 0.0) return;
+    const double total = wave->proc_frames / wave->rate, t0 = z0 * total, t1 = z1 * total;
+    double step;
+    if (grid == 1)
+    {
+        step = 0.01;
+        for (double s : { 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0 })
+        {
+            step = s;
+            if (s / (t1 - t0) * area.getWidth() >= 60.0) break;
+        }
+    }
+    else
+    {
+        if (tempo <= 0.0) return;
+        step = 60.0 / tempo;
+        while (step / (t1 - t0) * area.getWidth() < 8.0) step *= 2.0;
+    }
+    g.setFont (caps (9.f));
+    for (int i = (int) std::ceil (t0 / step); i * step <= t1; ++i)
+    {
+        const float x = area.getX() + area.getWidth() * (float) ((i * step - t0) / (t1 - t0));
+        const bool bar = grid == 2 && i % 4 == 0;
+        g.setColour (col::edgeLight.withAlpha (bar ? 0.35f : 0.14f));
+        g.drawVerticalLine ((int) x, area.getY(), area.getBottom());
+        if (grid == 1 || bar)
+        {
+            g.setColour (col::textFaint);
+            g.drawText (grid == 1 ? juce::String (i * step, step < 0.1 ? 3 : 2) + "s" : juce::String (i / 4 + 1),
+                        juce::Rectangle<float> (x + 2.f, area.getBottom() - 12.f, 50.f, 12.f), juce::Justification::centredLeft, false);
+        }
+    }
+}
+
+void WaveformView::paintSpectrum (juce::Graphics& g, juce::Rectangle<float> area)
+{
+    using namespace pt::ui;
+    const auto& an = wave->ana;
+    const auto plot = area.reduced (6.f, 6.f);
+    const double fmin = 30.0, fmax = juce::jmin (20000.0, wave->rate * 0.5);
+    auto fx = [&] (double f) { return plot.getX() + plot.getWidth() * (float) (std::log (f / fmin) / std::log (fmax / fmin)); };
+    g.setFont (caps (9.f));
+    for (double f : { 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0 })
+    {
+        if (f > fmax) break;
+        g.setColour (col::edgeLight.withAlpha (0.18f));
+        g.drawVerticalLine ((int) fx (f), plot.getY(), plot.getBottom());
+        g.setColour (col::textFaint);
+        g.drawText (f >= 1000.0 ? juce::String ((int) (f / 1000.0)) + "k" : juce::String ((int) f),
+                    juce::Rectangle<float> (fx (f) + 2.f, plot.getBottom() - 12.f, 40.f, 12.f), juce::Justification::centredLeft, false);
+    }
+    juce::Path p;
+    for (int i = 0; i < an->bins; ++i)
+    {
+        const float x = plot.getX() + plot.getWidth() * (float) i / (float) (an->bins - 1);
+        const float y = plot.getBottom() - plot.getHeight() * an->avg[(size_t) i];
+        if (i == 0) p.startNewSubPath (x, y); else p.lineTo (x, y);
+    }
+    juce::Path fill (p);
+    fill.lineTo (plot.getRight(), plot.getBottom());
+    fill.lineTo (plot.getX(), plot.getBottom());
+    fill.closeSubPath();
+    g.setColour (col::cyan.withAlpha (0.18f));
+    g.fillPath (fill);
+    g.setColour (col::cyan);
+    g.strokePath (p, juce::PathStrokeType (2.0f));
+}
+
 void WaveformView::paintIdle (juce::Graphics& g, juce::Rectangle<float> area, juce::Rectangle<float> header)
 {
     using namespace pt::ui;
-    g.setFont (caps (9.f));
-    g.setColour (col::textDim);
-    g.drawText ("WAVEFORM", header, juce::Justification::centredLeft, false);
+    hits.clear();
+    const bool has = wave != nullptr && ! wave->proc.empty();
 
-    if (wave == nullptr || wave->proc.empty())
+    g.setFont (caps (9.f));
+    auto tabs = header;
+    for (const char* nm : { "WAVE", "COLOUR", "SONO", "SPECTRUM" })
+    {
+        const int id = (int) hits.size();
+        auto r = tabs.removeFromLeft (textWidth (nm) + 14.f);
+        g.setColour (id == mode ? col::amber : col::textDim);
+        g.drawText (nm, r, juce::Justification::centred, false);
+        if (id == mode) g.fillRect (r.getX() + 4.f, r.getBottom() - 1.f, r.getWidth() - 8.f, 1.f);
+        hits.push_back ({ r, id });
+    }
+    tabs.removeFromLeft (10.f);
+    auto toggle = [&] (const juce::String& txt, int id, bool on)
+    {
+        auto r = tabs.removeFromLeft (textWidth (txt) + 14.f);
+        g.setColour (on ? col::cyan : col::textFaint);
+        g.drawText (txt, r, juce::Justification::centred, false);
+        hits.push_back ({ r, id });
+    };
+    toggle ("RAW", 10, showRaw);
+    toggle (grid == 0 ? "GRID" : grid == 1 ? "GRID: SEC" : "GRID: BEAT", 11, grid != 0);
+
+    if (! has)
     {
         g.setFont (caps (16.f));
         g.setColour (col::textFaint);
         g.drawText (busy ? "LOADING..." : "DROP A SAMPLE HERE", area.withTrimmedBottom (14.f), juce::Justification::centred, false);
-        if (!busy)
+        if (! busy)
         {
             g.setFont (sans (11.f));
             g.drawText ("WAV  AIFF  FLAC  OGG  MP3   -   or use LOAD on the SAMPLE tab", area.withTrimmedTop (area.getHeight() * 0.62f),
@@ -710,30 +922,101 @@ void WaveformView::paintIdle (juce::Graphics& g, juce::Rectangle<float> area, ju
     }
 
     const double secs = wave->rate > 0.0 ? wave->proc_frames / wave->rate : 0.0;
+    float pk = 0.0f;
+    for (size_t i = 0; i < wave->proc.lo.size(); ++i) pk = juce::jmax (pk, std::abs (wave->proc.lo[i]), std::abs (wave->proc.hi[i]));
+    juce::String info = juce::String (secs, 2) + " s  " + juce::String (wave->rate, 0) + " Hz  PK " + juce::String (20.0f * std::log10 (juce::jmax (pk, 1.0e-6f)), 1);
+    if (wave->ana != nullptr)
+        info << "  RMS " << juce::String (wave->ana->rms_db, 1) << "  DC " << juce::String (wave->ana->dc * 100.0f, 2) << "%";
     g.setColour (col::textDim);
-    g.drawText (juce::String (secs, 2) + " s   " + juce::String (wave->rate, 0) + " Hz", header, juce::Justification::centredRight, false);
+    g.drawText (info + " dB", header.withTrimmedLeft (header.getWidth() * 0.5f), juce::Justification::centredRight, false);
+
+    if (mode == Spectrum)
+    {
+        if (wave->ana != nullptr) paintSpectrum (g, area);
+        else { g.setColour (col::textFaint); g.drawText ("NO ANALYSIS", area, juce::Justification::centred, false); }
+        return;
+    }
+    if (mode == Sono && wave->ana != nullptr)
+    {
+        const auto& an = *wave->ana;
+        if (sonoFor != wave->ana.get())
+        {
+            sonoFor = wave->ana.get();
+            sonoImg = juce::Image (juce::Image::ARGB, an.cols, an.bins, false);
+            for (int c = 0; c < an.cols; ++c)
+                for (int b = 0; b < an.bins; ++b)
+                {
+                    const float v = an.img[(size_t) (c * an.bins + b)] / 255.0f;
+                    const auto col = v < 0.5f ? juce::Colour::fromFloatRGBA (0.0f, 0.0f, 0.0f, 1.0f).interpolatedWith (pt::ui::col::amberDim, v * 2.0f)
+                                              : pt::ui::col::amberDim.interpolatedWith (pt::ui::col::good.brighter (0.4f), (v - 0.5f) * 2.0f);
+                    sonoImg.setPixelAt (c, an.bins - 1 - b, col);
+                }
+        }
+        g.saveState();
+        g.reduceClipRegion (area.toNearestInt());
+        g.setImageResamplingQuality (juce::Graphics::mediumResamplingQuality);
+        const float sx = z0 * (float) an.cols, sw = (z1 - z0) * (float) an.cols;
+        g.drawImage (sonoImg, (int) area.getX(), (int) area.getY(), (int) area.getWidth(), (int) area.getHeight(),
+                     (int) sx, 0, juce::jmax (1, (int) sw), an.bins);
+        g.restoreState();
+        g.setFont (caps (9.f));
+        g.setColour (col::text.withAlpha (0.7f));
+        const double fmax = juce::jmin (20000.0, wave->rate * 0.5);
+        for (double f : { 100.0, 1000.0, 10000.0 })
+        {
+            if (f > fmax) break;
+            const float y = area.getBottom() - area.getHeight() * (float) (std::log (f / 30.0) / std::log (fmax / 30.0));
+            g.drawHorizontalLine ((int) y, area.getX(), area.getX() + 6.f);
+            g.drawText (f >= 1000.0 ? juce::String ((int) (f / 1000.0)) + "k" : juce::String ((int) f),
+                        juce::Rectangle<float> (area.getX() + 8.f, y - 6.f, 30.f, 12.f), juce::Justification::centredLeft, false);
+        }
+    }
+    else
+    {
+        if (showRaw)
+            fillPeaks (g, wave->raw, area, z0, z1, 1.0f, col::textDim, 0.18f);
+        if (mode == Colour && wave->ana != nullptr)
+        {
+            fillPeaks (g, wave->proc, area, z0, z1, 1.0f, col::cyan.withAlpha (0.0f), 0.0f,
+                       nullptr, [&] (float s)
+                       {
+                           const float f = z0 + (z1 - z0) * s;
+                           const int c = juce::jlimit (0, wave->ana->cols - 1, (int) (f * (float) wave->ana->cols));
+                           const float t = wave->ana->bright[(size_t) c];
+                           return juce::Colour::fromHSV (0.02f + 0.52f * t, 0.75f, 1.0f, 1.0f);
+                       });
+        }
+        else
+            fillPeaks (g, wave->proc, area, z0, z1, 1.0f, col::cyan, 0.35f);
+    }
+    paintGrid (g, area);
 
     if (wave->loop_a >= 0.0 && wave->loop_b > wave->loop_a && norm ("loop_use") > 0.5f)
     {
-        const float xa = area.getX() + area.getWidth() * (float) wave->loop_a;
-        const float xb = area.getX() + area.getWidth() * (float) wave->loop_b;
+        const float xa = toX ((float) wave->loop_a, area), xb = toX ((float) wave->loop_b, area);
+        g.saveState();
+        g.reduceClipRegion (area.toNearestInt());
         g.setColour (col::amber.withAlpha (0.10f));
         g.fillRect (juce::Rectangle<float> (xa, area.getY(), xb - xa, area.getHeight()));
         g.setColour (col::amber.withAlpha (0.8f));
         g.drawVerticalLine ((int) xa, area.getY(), area.getBottom());
         g.drawVerticalLine ((int) xb, area.getY(), area.getBottom());
+        g.restoreState();
     }
-
-    fillPeaks (g, wave->proc, area, 0.0f, 1.0f, 1.0f, col::cyan, 0.35f);
-
     const float so = norm ("start_offset");
-    if (so > 0.0005f)
+    if (so > 0.0005f || drag == 0)
     {
-        const float x = area.getX() + area.getWidth() * so;
+        const float x = toX (so, area);
         g.setColour (col::good);
         g.drawVerticalLine ((int) x, area.getY(), area.getBottom());
         g.setFont (caps (9.f));
         g.drawText ("START", juce::Rectangle<float> (x + 3.f, area.getY(), 60.f, 12.f), juce::Justification::centredLeft, false);
+    }
+    if (z1 - z0 < 0.999f)
+    {
+        g.setFont (caps (9.f));
+        g.setColour (col::textDim);
+        g.drawText (juce::String (1.0f / (z1 - z0), 1) + "x  (double-click resets)", area.reduced (4.f), juce::Justification::topRight, false);
     }
 }
 
@@ -1134,6 +1417,129 @@ void WaveformView::paintTweak (juce::Graphics& g, juce::Rectangle<float> area, j
     g.drawText (tweak->getCurrentValueAsText(), area, juce::Justification::centred, false);
 }
 
+// ---- PresetBar ---------------------------------------------------------------
+PresetBar::PresetBar (AlphaSamplerAudioProcessor& p) : proc (p)
+{
+    prev.onClick = [this] { step (-1); };
+    next.onClick = [this] { step (1); };
+    name.onClick = [this] { menu(); };
+    saveBtn.onClick = [this] { save(); };
+    undoBtn.onClick = [this] { undo(); };
+    redoBtn.onClick = [this] { redo(); };
+    for (juce::Component* c : std::initializer_list<juce::Component*> { &prev, &name, &next, &saveBtn, &undoBtn, &redoBtn })
+        addAndMakeVisible (c);
+    refresh();
+}
+
+void PresetBar::resized()
+{
+    auto a = getLocalBounds();
+    prev.setBounds (a.removeFromLeft (26));
+    a.removeFromLeft (2);
+    redoBtn.setBounds (a.removeFromRight (46));
+    a.removeFromRight (2);
+    undoBtn.setBounds (a.removeFromRight (46));
+    a.removeFromRight (2);
+    saveBtn.setBounds (a.removeFromRight (46));
+    a.removeFromRight (2);
+    next.setBounds (a.removeFromRight (26));
+    a.removeFromRight (2);
+    name.setBounds (a);
+}
+
+void PresetBar::refresh()
+{
+    const auto n = proc.presetName();
+    const auto txt = n.isEmpty() ? juce::String ("INIT / UNSAVED") : n.toUpperCase();
+    if (name.getButtonText() != txt) name.setButtonText (txt);
+    undoBtn.setEnabled (proc.canUndo());
+    redoBtn.setEnabled (proc.canRedo());
+}
+
+void PresetBar::undo() { proc.undoStep(); refresh(); }
+void PresetBar::redo() { proc.redoStep(); refresh(); }
+
+static void collectUser (const juce::File& dir, std::vector<juce::File>& out)
+{
+    for (const auto& f : dir.findChildFiles (juce::File::findFiles, false, "*.xml", juce::File::FollowSymlinks::no)) out.push_back (f);
+    for (const auto& d : dir.findChildFiles (juce::File::findDirectories, false, "*", juce::File::FollowSymlinks::no)) collectUser (d, out);
+}
+
+std::vector<PresetBar::Item> PresetBar::items() const
+{
+    std::vector<Item> v;
+    for (int i = 0; i < AlphaSamplerAudioProcessor::factoryCount(); ++i) v.push_back ({ AlphaSamplerAudioProcessor::factoryName (i), i, {} });
+    std::vector<juce::File> files;
+    collectUser (proc.presetDir(), files);
+    std::sort (files.begin(), files.end(), [] (const juce::File& a, const juce::File& b) { return a.getFullPathName().compareIgnoreCase (b.getFullPathName()) < 0; });
+    for (const auto& f : files) v.push_back ({ f.getFileNameWithoutExtension(), -1, f });
+    return v;
+}
+
+void PresetBar::choose (const Item& it)
+{
+    if (it.factory >= 0) proc.applyFactory (it.factory);
+    else proc.loadUserPreset (it.file);
+    refresh();
+}
+
+void PresetBar::step (int dir)
+{
+    const auto v = items();
+    if (v.empty()) return;
+    int cur = -1;
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].name == proc.presetName()) cur = (int) i;
+    const int n = (int) v.size();
+    choose (v[(size_t) (((cur < 0 ? (dir > 0 ? -1 : 0) : cur) + dir + n) % n)]);
+}
+
+void PresetBar::menu()
+{
+    const auto v = items();
+    juce::PopupMenu root, fac;
+    std::map<juce::String, juce::PopupMenu> subs;
+    const auto base = proc.presetDir();
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        if (v[i].factory >= 0) { fac.addItem ((int) i + 1, v[i].name, true, v[i].name == proc.presetName()); continue; }
+        const auto rel = v[i].file.getParentDirectory().getRelativePathFrom (base).replaceCharacter ('\\', '/');
+        auto& m = rel == "." ? root : subs[rel];
+        m.addItem ((int) i + 1, v[i].name, true, v[i].name == proc.presetName());
+    }
+    juce::PopupMenu top;
+    top.addSubMenu ("Factory", fac);
+    top.addSeparator();
+    for (auto& [k, m] : subs) top.addSubMenu (k, m);
+    top.addItem (-2, "Open preset folder");
+    top.addItem (-3, "Refresh");
+    top.addSeparator();
+    // user presets that sit directly in the preset folder
+    root.addSeparator();
+    top.addSubMenu ("User", root);
+    top.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&name),
+        [this, v, safe = juce::Component::SafePointer<PresetBar> (this)] (int r)
+        {
+            if (safe == nullptr || r == 0) return;
+            if (r == -2) { proc.presetDir().createDirectory(); proc.presetDir().revealToUser(); return; }
+            if (r > 0 && (size_t) r <= v.size()) choose (v[(size_t) r - 1]);
+        });
+}
+
+void PresetBar::save()
+{
+    auto* w = new juce::AlertWindow ("Save preset", "Name (use folder/name for sub-folders).\nSaved in Documents/Alpha Sampler/Presets", juce::MessageBoxIconType::NoIcon);
+    w->addTextEditor ("n", proc.presetName());
+    w->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    w->addButton ("Save + sample", 2);
+    w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    w->enterModalState (true, juce::ModalCallbackFunction::create ([this, w, safe = juce::Component::SafePointer<PresetBar> (this)] (int r)
+    {
+        if (safe != nullptr && r > 0) proc.saveUserPreset (w->getTextEditorContents ("n"), r == 2);
+        if (safe != nullptr) safe->refresh();
+    }), true);
+}
+
 // ---- KnobCell --------------------------------------------------------------
 KnobCell::KnobCell()
 {
@@ -1278,13 +1684,17 @@ SamplePage::SamplePage (AlphaSamplerAudioProcessor& p) : processor (p)
             });
     };
     clearButton.onClick = [this] { processor.clearFile(); updateFileLabel(); };
+    detectButton.onClick = [this] { processor.detectTempo(); };
+    fitButton.onClick = [this] { processor.fitToHost(); };
+    bpmLabel.setFont (pt::ui::sans (12.f));
+    bpmLabel.setColour (juce::Label::textColourId, pt::ui::col::textDim);
 
     fileLabel.setFont (pt::ui::sans (12.f));
     fileLabel.setColour (juce::Label::textColourId, pt::ui::col::textDim);
     fileLabel.setJustificationType (juce::Justification::centredLeft);
 
     for (juce::Component* c : std::initializer_list<juce::Component*> { &loadButton, &clearButton, &fileLabel,
-            &keepDisk, &resample, &loadRegions, &loadSlices, &declickMode, &startOffset })
+            &keepDisk, &resample, &loadRegions, &loadSlices, &declickMode, &startOffset, &detectButton, &fitButton, &bpmLabel })
         addAndMakeVisible (c);
     updateFileLabel();
 }
@@ -1293,6 +1703,17 @@ void SamplePage::updateFileLabel()
 {
     const auto path = processor.samplePath();
     fileLabel.setText (path.isEmpty() ? "no file loaded" : juce::File (path).getFileName(), juce::dontSendNotification);
+}
+
+void SamplePage::updateTempoLabel()
+{
+    const auto st = processor.bpm_state.load();
+    const float bpm = processor.bpm_found.load(), beats = processor.beats_found.load();
+    bpmLabel.setText (st == 1 ? "analysing..." : st == 2 ? "no tempo found"
+                      : bpm > 0.0f ? juce::String (bpm, 1) + " BPM  /  " + juce::String (beats, beats == std::floor (beats) ? 0 : 2) + " beats   (host "
+                                       + juce::String (processor.hostTempo(), 1) + ")"
+                      : juce::String(), juce::dontSendNotification);
+    fitButton.setEnabled (beats > 0.0f);
 }
 
 void SamplePage::resized()
@@ -1309,6 +1730,13 @@ void SamplePage::resized()
     a.removeFromTop (8);
     placeGrid (a.removeFromTop (130), 4, 130, { &startOffset, nullptr, nullptr, nullptr });
     placeGrid (a.removeFromTop (60), 2, 60, { &declickMode, nullptr });
+    a.removeFromTop (10);
+    auto t = a.removeFromTop (30);
+    detectButton.setBounds (t.removeFromLeft (120));
+    t.removeFromLeft (6);
+    fitButton.setBounds (t.removeFromLeft (110));
+    t.removeFromLeft (10);
+    bpmLabel.setBounds (t);
 }
 
 // ---- other pages -------------------------------------------------------------
@@ -1511,6 +1939,8 @@ AlphaSamplerAudioProcessorEditor::AlphaSamplerAudioProcessorEditor (AlphaSampler
     setup (meterLabelOut, "OUT", pt::ui::caps (9.f), pt::ui::col::cyan, juce::Justification::centred);
     setup (meterLabelPeak, "PEAK", pt::ui::caps (9.f), pt::ui::col::missed.brighter (0.25f), juce::Justification::centred);
     addAndMakeVisible (scope);
+    addAndMakeVisible (presets);
+    setWantsKeyboardFocus (true);
     addAndMakeVisible (waveform);
     addAndMakeVisible (outMeter);
     addAndMakeVisible (peakMeter);
@@ -1552,10 +1982,11 @@ void AlphaSamplerAudioProcessorEditor::resized()
 {
     auto a = getLocalBounds().reduced (10);
     auto header = a.removeFromTop (58).reduced (12, 6);
-    auto left = header.removeFromLeft (header.getWidth() / 2);
+    auto left = header.removeFromLeft (230);
     title.setBounds (left.removeFromTop (26));
     subtitle.setBounds (left);
-    status.setBounds (header.removeFromRight (200));
+    status.setBounds (header.removeFromRight (110));
+    presets.setBounds (header.reduced (6, 4));
     a.removeFromTop (8);
     waveform.setBounds (a.removeFromTop (juce::jlimit (150, 260, a.getHeight() / 4)));
     a.removeFromTop (8);
@@ -1573,6 +2004,14 @@ void AlphaSamplerAudioProcessorEditor::resized()
 
     a.removeFromRight (8);
     tabs.setBounds (a);
+}
+
+bool AlphaSamplerAudioProcessorEditor::keyPressed (const juce::KeyPress& k)
+{
+    const auto m = k.getModifiers();
+    if (m.isCommandDown() && k.getKeyCode() == 'Z') { m.isShiftDown() ? presets.redo() : presets.undo(); return true; }
+    if (m.isCommandDown() && k.getKeyCode() == 'Y') { presets.redo(); return true; }
+    return false;
 }
 
 // ---- drag & drop ------------------------------------------------------------
@@ -1621,6 +2060,9 @@ void AlphaSamplerAudioProcessorEditor::timerCallback()
         waveform.setWave (processor.waveView());
     }
     waveform.setTweak (watcher.active());
+    waveform.setTempo (processor.hostTempo());
+    presets.refresh();
+    samplePage.updateTempoLabel();
     waveform.setBusy (processor.load_state.load() == 1);
 
     juce::String text;

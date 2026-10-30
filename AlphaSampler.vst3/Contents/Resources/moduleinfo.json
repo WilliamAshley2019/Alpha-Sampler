@@ -1,6 +1,6 @@
 {
   "Name": "AlphaSampler",
-  "Version": "1.0.0",
+  "Version": "1.0.3",
   "Factory Info": {
     "Vendor": "William Ashley Music",
     "URL": "https://williamashley.music",
@@ -17,7 +17,7 @@
       "Category": "Audio Module Class",
       "Name": "AlphaSampler",
       "Vendor": "William Ashley Music",
-      "Version": "1.0.0",
+      "Version": "1.0.3",
       "SDKVersion": "VST 3.8.0",
       "Sub Categories": [
         "Instrument",
@@ -33,7 +33,7 @@
       "Category": "Component Controller Class",
       "Name": "AlphaSampler",
       "Vendor": "William Ashley Music",
-      "Version": "1.0.0",
+      "Version": "1.0.3",
       "SDKVersion": "VST 3.8.0",
       "Sub Categories": [
         "Instrument",

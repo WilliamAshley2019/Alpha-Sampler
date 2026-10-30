@@ -177,20 +177,64 @@ public:
     void setTweak (juce::AudioProcessorParameter*);   // call every tick; repaints only on change
     void setDragHover (bool);
     void setBusy (bool);
+    void setTempo (double bpm) { if (bpm != tempo) { tempo = bpm; if (grid == 2) repaint(); } }
     void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+    void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
 
 private:
+    enum Mode { Wave, Colour, Sono, Spectrum };
+    juce::Rectangle<float> areaRect() const;
+    float toFrac (float x) const;
+    float toX (float frac, juce::Rectangle<float> a) const;
+    int markerAt (float x) const;   // 0 start, 1 loop A, 2 loop B, -1 none
     void paintIdle  (juce::Graphics&, juce::Rectangle<float> area, juce::Rectangle<float> header);
     void paintTweak (juce::Graphics&, juce::Rectangle<float> area, juce::Rectangle<float> header);
+    void paintGrid  (juce::Graphics&, juce::Rectangle<float> area);
+    void paintSpectrum (juce::Graphics&, juce::Rectangle<float> area);
     float norm (const juce::String& id) const;
     float val  (const juce::String& id) const;
+    void setNorm (const juce::String& id, float v, bool begin, bool end);
 
     juce::AudioProcessorValueTreeState& apvts;
     std::shared_ptr<const WaveView> wave;
     juce::AudioProcessorParameter* tweak = nullptr;
     float tweakValue = -1.0f;
-    bool hover = false, busy = false;
+    bool hover = false, busy = false, showRaw = false;
+    int mode = Wave, grid = 0, drag = -1;
+    float z0 = 0.0f, z1 = 1.0f, panAnchor = 0.0f;
+    double tempo = 0.0;
+    std::vector<std::pair<juce::Rectangle<float>, int>> hits;
+    juce::Image sonoImg;
+    const Spectro* sonoFor = nullptr;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WaveformView)
+};
+
+// Preset browser, save and undo/redo for the header.
+class PresetBar final : public juce::Component
+{
+public:
+    explicit PresetBar (AlphaSamplerAudioProcessor&);
+    void resized() override;
+    void refresh();
+    void undo();
+    void redo();
+
+private:
+    struct Item { juce::String name; int factory = -1; juce::File file; };
+    std::vector<Item> items() const;
+    void step (int dir);
+    void menu();
+    void save();
+    void choose (const Item&);
+
+    AlphaSamplerAudioProcessor& proc;
+    juce::TextButton prev { "<" }, next { ">" }, name, saveBtn { "SAVE" }, undoBtn { "UNDO" }, redoBtn { "REDO" };
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PresetBar)
 };
 
 // ---- parameter cells ---------------------------------------------------------
@@ -251,11 +295,12 @@ public:
     explicit SamplePage (AlphaSamplerAudioProcessor&);
     void resized() override;
     void updateFileLabel();
+    void updateTempoLabel();
 
 private:
     AlphaSamplerAudioProcessor& processor;
-    juce::TextButton loadButton { "LOAD" }, clearButton { "CLEAR" };
-    juce::Label fileLabel;
+    juce::TextButton loadButton { "LOAD" }, clearButton { "CLEAR" }, detectButton { "DETECT TEMPO" }, fitButton { "FIT TO HOST" };
+    juce::Label fileLabel, bpmLabel;
     std::unique_ptr<juce::FileChooser> chooser;
     ToggleCell keepDisk, resample, loadRegions, loadSlices;
     ChoiceCell declickMode;
@@ -357,6 +402,7 @@ public:
 
     void paint (juce::Graphics&) override;
     void resized() override;
+    bool keyPressed (const juce::KeyPress&) override;
 
     // Drag & drop a sample file onto the window to load it.
     bool isInterestedInFileDrag (const juce::StringArray& files) override;
@@ -372,6 +418,7 @@ private:
     uint32_t shownWave = 0;
     pt::ui::AlumLookAndFeel lookAndFeel;
 
+    PresetBar presets { processor };
     juce::Label title, subtitle, status, scopeLabel, meterLabelOut, meterLabelPeak;
     ScopeView scope;
     WaveformView waveform { processor.apvts() };

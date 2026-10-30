@@ -422,8 +422,23 @@ struct Peaks
     bool empty() const noexcept { return lo.empty(); }
 };
 
+struct Spectro
+{
+    int cols = 0, bins = 0;
+    std::vector<uint8_t> img;     // cols*bins, row 0 = lowest band, 0..255 = -90..0 dB
+    std::vector<float> avg;       // per band 0..1
+    std::vector<float> bright;    // per column 0..1 (log spectral centroid)
+    float rms_db = -120.0f, dc = 0.0f;
+    bool empty() const noexcept { return cols == 0; }
+};
+
+using Fetch = std::function<void(size_t pos, size_t n, float* mono)>;
+std::shared_ptr<const Spectro> analyse(const Fetch& fetch, size_t frames, double rate);
+std::optional<double> detect_bpm(const std::vector<float>& mono, double rate, double& beats_out);
+
 struct WaveView
 {
+    std::shared_ptr<const Spectro> ana;
     Peaks raw;                    // the file as loaded
     Peaks proc;                   // after the effects/stretch pipeline (what voices play)
     double rate = 0.0;            // sample rate of the processed sample
@@ -1038,6 +1053,25 @@ public:
     void clearFile();
     void preview(uint8_t key, float vel, bool on);
 
+    bool canUndo() const { return !undo_stack_.empty(); }
+    bool canRedo() const { return !redo_stack_.empty(); }
+    void undoStep() { step_history(undo_stack_, redo_stack_); }
+    void redoStep() { step_history(redo_stack_, undo_stack_); }
+    static int factoryCount();
+    static juce::String factoryName(int i);
+    void applyFactory(int i);
+    void initPatch();
+    juce::File presetDir() const;
+    bool saveUserPreset(const juce::String& relName, bool with_sample);
+    bool loadUserPreset(const juce::File& f);
+    juce::String presetName() const { return preset_name_; }
+    void detectTempo();
+    void fitToHost();
+    double hostTempo() const { return tempo_value(); }
+    std::atomic<float> bpm_found { 0.0f };
+    std::atomic<float> beats_found { 0.0f };
+    std::atomic<int> bpm_state { 0 };   // 0 idle, 1 working, 2 failed
+
     // Read by the editor.
     std::shared_ptr<std::atomic<uint32_t>> frames;
     std::atomic<float> meter_l { 0.0f }, meter_r { 0.0f };
@@ -1116,6 +1150,20 @@ private:
 
     juce::String file_settings_;
     juce::String sample_path_;
+    juce::String preset_name_;
+    std::atomic<int64_t> sample_mtime_ { 0 };
+    std::atomic<bool> tempo_req_ { false };
+    void resetParams();
+    using Snap = std::vector<float>;
+    std::vector<Snap> undo_stack_, redo_stack_;
+    bool hist_suspend_ = false;
+    struct HistListener;
+    std::unique_ptr<HistListener> hist_;
+    Snap snapshot() const;
+    void push_snapshot();
+    void step_history(std::vector<Snap>& from, std::vector<Snap>& to);
+    void apply_state(const juce::ValueTree& vt, bool load_sample);
+    void detect_tempo_now();
 
     juce::AudioProcessorValueTreeState::ParameterLayout makeLayout();
 
@@ -1146,6 +1194,8 @@ private:
     std::shared_ptr<const WaveView> wave_;
     std::shared_ptr<const Peaks> raw_peaks_;      // work_lock_
     uint64_t raw_peaks_version_ = ~uint64_t { 0 };
+    std::shared_ptr<const Spectro> ana_cache_;   // work_lock_
+    uint64_t ana_version_ = ~uint64_t { 0 };
     void set_wave(std::shared_ptr<const WaveView> w);
     std::shared_ptr<const Peaks> raw_peaks_for(uint64_t version, const juce::File& path, const Sample* raw);
 
