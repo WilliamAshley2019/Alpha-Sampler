@@ -5,7 +5,8 @@ ADDED PYTHON SCRIPTS I added some starter editor scripts
 Note you need to AFAIK have python installed I make scripts for python 3.
 
 You can likely make scripts for whatever version of python you have installed of course but I am not cause I don't use those versions of python.
-
+SEE SCRIPT_FORMAT.md
+script_template.py
 
 Specific scripts added so far.. more to come as available currently testing these I think 
 
@@ -28,8 +29,6 @@ resample.py
 Reverse.py
 ring_mod.py
 RMSNormalize.py
-SCRIPT_FORMAT.md
-script_template.py
 SoftClip.py
 stereo_to_mono.py THIS ONE DOESNT WORK NEED TO FINISH IT
 stereo_width.py
