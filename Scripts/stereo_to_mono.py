@@ -1,15 +1,4 @@
-"""Alpha Sampler script: stereo to mono (or dual-mono).
-
-Default: writes a single channel = 0.5*(L+R)  (averaged, no clipping).
-dual=1:  keeps stereo, writes the averaged signal to BOTH channels.
-
-Channel count changes for the default mode (mono out). Slice markers keep
-their time positions but the sample is now mono. Stdlib only.
-
-Usage: stereo_to_mono.py in.wav out.wav rate=<Hz> bpm=<tempo> root=<note> slices=<f1,f2,...> [dual=0]
-Optional keys:
-  dual  1 = dual-mono (stay stereo, both channels = average) (default 0)
-"""
+"""Alpha Sampler edit script: stereo -> mono (equal-power downmix)."""
 import sys, wave, struct
 
 
@@ -17,23 +6,58 @@ def read_wav(path):
     with wave.open(path, 'rb') as w:
         ch, width, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
         raw = w.readframes(n)
-    if width == 1:
-        ints = [b - 128 for b in raw]
-        scale = 128.0
+    if width == 3:
+        ints = [int.from_bytes(raw[i:i + 3], 'little', signed=True) for i in range(0, len(raw), 3)]
     elif width == 2:
         ints = list(struct.unpack('<%dh' % (len(raw) // 2), raw))
-        scale = 32768.0
-    elif width == 3:
-        ints = [int.from_bytes(raw[i:i + 3], 'little', signed=True) for i in range(0, len(raw), 3)]
-        scale = 8388608.0
-    elif width == 4:
-        ints = list(struct.unpack('<%di' % (len(raw) // 4), raw))
-        scale = 2147483648.0
     else:
-        raise SystemExit('unsupported sample width %d' % width)
-    chans = [[v / scale for v in ints[c::ch]] for c in range(ch)]
-    return rate, chans
+        raise SystemExit('unsupported sample width %d (plugin always sends 24-bit)' % width)
+    scale = float(1 << (8 * width - 1))
+    return rate, [[v / scale for v in ints[c::ch]] for c in range(ch)]
 
 
-def write_wav(path, rate, chans, bits=24):
+def write_wav(path, rate, chans):
     n = min(len(c) for c in chans)
+    out = bytearray()
+    for i in range(n):
+        for c in chans:
+            v = max(-8388608, min(8388607, int(round(c[i] * 8388608.0))))
+            out += v.to_bytes(3, 'little', signed=True)
+    with wave.open(path, 'wb') as w:
+        w.setnchannels(len(chans)); w.setsampwidth(3); w.setframerate(rate)
+        w.writeframes(bytes(out))
+
+
+def process(rate, chans, opts):
+    """Downmix to mono. opt 'mode' = 'sum' | 'avg' | 'left' | 'right'.
+    Default 'sum' = equal-power (divide by sqrt(N)); 'avg' = divide by N."""
+    n = len(chans[0])
+    mode = opts.get('mode', 'sum').lower()
+    if len(chans) == 1:
+        return rate, chans
+    left, right = chans[0], chans[1]
+    if mode == 'left':
+        mono = list(left)
+    elif mode == 'right':
+        mono = list(right)
+    elif mode == 'avg':
+        mono = [(left[i] + right[i]) * 0.5 for i in range(n)]
+    else:  # 'sum' equal-power
+        g = 1.0 / (2.0 ** 0.5)
+        mono = [(left[i] + right[i]) * g for i in range(n)]
+    # simple peak guard
+    peak = max((abs(v) for v in mono), default=0.0)
+    if peak > 0.999:
+        s = 0.999 / peak
+        mono = [v * s for v in mono]
+    return rate, [mono]
+
+
+if __name__ == '__main__':
+    src, dst = sys.argv[1], sys.argv[2]
+    opts = dict(a.split('=', 1) for a in sys.argv[3:] if '=' in a)
+    opts['slices'] = [float(x) for x in opts.get('slices', '').split(',') if x]
+    rate, chans = read_wav(src)
+    rate, chans = process(rate, chans, opts)
+    write_wav(dst, rate, chans)
+    print('ok')
