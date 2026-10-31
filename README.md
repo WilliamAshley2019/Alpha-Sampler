@@ -1,3 +1,19 @@
+NOTE:  To be honest I am a little impressed with how capable this sampler is now running a few % CPU ... it actually gave me that feeling wow, pretty darn impressive for what it is........ I will have to test for a while to get a sense for it. And wh
+
+
+Version 1.0.4
+
+Added slicing its in the MISC tab. 
+
+Added slice exports so samples can not be exported 
+TODO move slice markers manually.
+TODO export WITH slice markers written the the wav file. compatible with other formats such as REX.
+
+render and RECORD Function etc.. HOWEVER USE A DIFFERENT INSTANCE OF ALPHA SAMPLER TO RECORD!!!!!!! it will overwrite your current sample loaded if your record in a used alpha sampler!!!! 
+TO DO ADD UNDO RECORD OVERWRITE 
+ADDED PYTHON  SCRIPTING THIS IS STILL EXPERIMENTAL!!!!!
+
+
 Version 1.0.3
 
 Added a few more visual elements
