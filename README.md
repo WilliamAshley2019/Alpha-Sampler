@@ -1,8 +1,12 @@
 Version 1.0.5
-Added individual slice selection
-Added add remove slice markers
-Added drag and drop slice or sample into daw
-Samples now retain slice data both for load and export.
+
+-Added individual slice selection
+
+-Added add remove slice markers
+
+-Added drag and drop slice or sample into daw
+
+-Samples now retain slice data both for load and export.
 
 Issues: I still havn't addressed the record function need to figure out how to go about that specifically as routing audio into a plugin from FL Studio is something I had to use global memory for in the past not sure if there is another way as routing has output but I can't find input into generators may need to loop back trhough paired effect plugin to handle audio bus routing functions.
 
