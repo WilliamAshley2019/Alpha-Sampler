@@ -1,3 +1,38 @@
+TRICK OR TREAT OCTOBER 31st 2026
+ADDED PYTHON SCRIPTS I added some starter editor scripts
+Note you need to AFAIK have python installed I make scripts for python 3.
+You can likely make scripts for whatever version of python you have installed of course but I am not cause I don't use those versions of python.
+
+Specific scripts added so far.. more to come as available currently testing these I think 
+bit_crush.py
+channel_swap.py
+dc_remove.py
+FadeIn.py
+FadeOut.py
+Gain.py
+haas.py
+highpass.py
+LoopCrossfade.py
+lowpass.py
+mid_side_encode.py
+pan.py
+PeakNormalize.py
+PitchShift.py
+polarize.py
+resample.py
+Reverse.py
+ring_mod.py
+RMSNormalize.py
+SCRIPT_FORMAT.md
+script_template.py
+SoftClip.py
+stereo_to_mono.py THIS ONE DOESNT WORK NEED TO FINISH IT
+stereo_width.py
+TempoSync.py
+TrimSilence.py
+ZeroCrossingTrim.py
+
+
 Version 1.0.5
 
 -Added individual slice selection
