@@ -508,6 +508,104 @@ bool write_wav(const juce::File& f, const juce::AudioBuffer<float>& b, double ra
 }
 } // namespace
 
+
+namespace {
+juce::AudioBuffer<float> slice_part(const juce::AudioBuffer<float>& b, int a, int z)
+{
+    juce::AudioBuffer<float> part(2, z - a);
+    for (int c = 0; c < 2; ++c) part.copyFrom(c, 0, b, c, a, z - a);
+    part.applyGainRamp(std::max(0, z - a - 64), 64, 1.0f, 0.0f);
+    return part;
+}
+
+// Appends a RIFF 'cue ' chunk plus 'LIST adtl' labels so DAWs/editors show the slice markers.
+bool embed_cues(const juce::File& f, const std::vector<uint32_t>& pos)
+{
+    if (pos.empty()) return true;
+    juce::MemoryBlock mb;
+    if (!f.loadFileAsData(mb) || mb.getSize() < 12) return false;
+    if (mb.getSize() & 1u) mb.append("\0", 1);
+    juce::MemoryOutputStream os(mb, true);
+    auto id = [&](const char* t) { os.write(t, 4); };
+    id("cue ");
+    os.writeInt(static_cast<int>(4 + 24 * pos.size()));
+    os.writeInt(static_cast<int>(pos.size()));
+    for (size_t i = 0; i < pos.size(); ++i) {
+        os.writeInt(static_cast<int>(i + 1)); os.writeInt(static_cast<int>(pos[i]));
+        id("data"); os.writeInt(0); os.writeInt(0); os.writeInt(static_cast<int>(pos[i]));
+    }
+    juce::MemoryOutputStream lab;
+    for (size_t i = 0; i < pos.size(); ++i) {
+        const auto txt = "Slice " + juce::String(static_cast<int>(i) + 1);
+        const int len = 4 + static_cast<int>(txt.getNumBytesAsUTF8()) + 1;
+        lab.write("labl", 4); lab.writeInt(len); lab.writeInt(static_cast<int>(i + 1));
+        lab.write(txt.toRawUTF8(), txt.getNumBytesAsUTF8()); lab.writeByte(0);
+        if (len & 1) lab.writeByte(0);
+    }
+    id("LIST");
+    os.writeInt(static_cast<int>(4 + lab.getDataSize()));
+    id("adtl");
+    os.write(lab.getData(), lab.getDataSize());
+    os.flush();
+    const uint32_t riff = static_cast<uint32_t>(mb.getSize() - 8);
+    mb.copyFrom(&riff, 4, 4);   // little-endian host assumed (x86/ARM Windows)
+    return f.replaceWithData(mb.getData(), mb.getSize());
+}
+} // namespace
+
+std::vector<uint32_t> wav_cues(const juce::File& f)
+{
+    std::vector<uint32_t> out;
+    std::ifstream in(f.getFullPathName().toStdString(), std::ios::binary);
+    char head[12];
+    if (!in.read(head, 12) || std::memcmp(head, "RIFF", 4) != 0 || std::memcmp(head + 8, "WAVE", 4) != 0) return out;
+    auto u32 = [](const unsigned char* p) { return static_cast<uint32_t>(p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24)); };
+    for (;;) {
+        unsigned char ch[8];
+        if (!in.read(reinterpret_cast<char*>(ch), 8)) break;
+        const uint32_t len = u32(ch + 4);
+        if (std::memcmp(ch, "cue ", 4) == 0 && len >= 4 && len < (1u << 20)) {
+            std::vector<unsigned char> d(len);
+            if (!in.read(reinterpret_cast<char*>(d.data()), len)) break;
+            const uint32_t n = std::min(u32(d.data()), (len - 4) / 24);
+            for (uint32_t i = 0; i < n; ++i) out.push_back(u32(d.data() + 4 + 24 * i + 20));
+            break;
+        }
+        in.seekg(static_cast<std::streamoff>(len) + (len & 1u), std::ios::cur);
+        if (!in) break;
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<uint32_t> AlphaSamplerAudioProcessor::cue_frames(int total) const
+{
+    std::vector<uint32_t> v;
+    for (float s : slices()) v.push_back(static_cast<uint32_t>(s * static_cast<float>(total)));
+    return v;
+}
+
+juce::File AlphaSamplerAudioProcessor::dragFile(int slice)
+{
+    juce::AudioBuffer<float> b;
+    double rate = 0.0;
+    if (!processed_buffer(b, rate)) return {};
+    const auto dir = dataDir().getChildFile("Drag");
+    const auto base = juce::File(sample_path_).getFileNameWithoutExtension();
+    const auto sl = slices();
+    const int N = b.getNumSamples();
+    if (slice < 0) {
+        const auto f = dir.getChildFile(base + "_sliced.wav");
+        return write_wav(f, b, rate) && embed_cues(f, cue_frames(N)) ? f : juce::File();
+    }
+    if (slice >= static_cast<int>(sl.size())) return {};
+    const int a = static_cast<int>(sl[static_cast<size_t>(slice)] * static_cast<float>(N));
+    const int z = static_cast<size_t>(slice) + 1 < sl.size() ? static_cast<int>(sl[static_cast<size_t>(slice) + 1] * static_cast<float>(N)) : N;
+    if (z - a < 2) return {};
+    const auto f = dir.getChildFile(base + "_slice_" + juce::String(slice + 1).paddedLeft('0', 2) + ".wav");
+    return write_wav(f, slice_part(b, a, z), rate) ? f : juce::File();
+}
+
 // Processed sample as the voices play it at their root note (disk-streamed samples are read from the file).
 bool AlphaSamplerAudioProcessor::processed_buffer(juce::AudioBuffer<float>& out, double& rate)
 {
@@ -573,10 +671,10 @@ void AlphaSamplerAudioProcessor::render_note(const juce::AudioBuffer<float>& src
     out.setSize(2, std::max(1, end), true);
 }
 
-void AlphaSamplerAudioProcessor::exportAudio(const juce::File& dest, int mode, bool load_after)
+void AlphaSamplerAudioProcessor::exportAudio(const juce::File& dest, int mode, bool load_after, bool markers)
 {
     setStatus("rendering...");
-    runJob([this, dest, mode, load_after] {
+    runJob([this, dest, mode, load_after, markers] {
         juce::AudioBuffer<float> b;
         double rate = 0.0;
         if (!processed_buffer(b, rate)) { setStatus("nothing to render"); return; }
@@ -590,9 +688,7 @@ void AlphaSamplerAudioProcessor::exportAudio(const juce::File& dest, int mode, b
                 const int a = static_cast<int>(sl[i] * static_cast<float>(b.getNumSamples()));
                 const int z = i + 1 < sl.size() ? static_cast<int>(sl[i + 1] * static_cast<float>(b.getNumSamples())) : b.getNumSamples();
                 if (z - a < 2) continue;
-                juce::AudioBuffer<float> part(2, z - a);
-                for (int c = 0; c < 2; ++c) part.copyFrom(c, 0, b, c, a, z - a);
-                part.applyGainRamp(std::max(0, z - a - 64), 64, 1.0f, 0.0f);
+                const auto part = slice_part(b, a, z);
                 ok += write_wav(dest.getChildFile(base + "_slice_" + juce::String(static_cast<int>(i) + 1).paddedLeft('0', 2) + ".wav"), part, rate) ? 1 : 0;
             }
             setStatus("exported " + juce::String(ok) + " slices");
@@ -600,6 +696,7 @@ void AlphaSamplerAudioProcessor::exportAudio(const juce::File& dest, int mode, b
         }
         if (mode == 1) { juce::AudioBuffer<float> o; render_note(b, rate, o); b = std::move(o); }
         if (!write_wav(dest, b, rate)) { setStatus("write failed: " + dest.getFileName()); return; }
+        if (markers && mode == 0) embed_cues(dest, cue_frames(b.getNumSamples()));
         setStatus("saved " + dest.getFileName());
         if (load_after) { const std::lock_guard<std::mutex> lk(status_lock_); load_request_ = { dest, true }; }
     });
@@ -618,7 +715,10 @@ void AlphaSamplerAudioProcessor::runScript(const juce::File& script)
     const auto py = python_path_;
     const double bpm = tempo_value();
     const int rt = root->getIndex();
-    runJob([this, script, in, py, bpm, rt] {
+    juce::StringArray sls;
+    for (float s : slices()) sls.add(juce::String(s, 6));
+    const auto sl_arg = sls.joinIntoString(",");
+    runJob([this, script, in, py, bpm, rt, sl_arg] {
         const auto tmp_in = dataDir().getChildFile("Edits").getChildFile("_script_input.wav");
         {
             std::unique_ptr<juce::AudioFormatReader> r(library_.formats().createReaderFor(in));
@@ -632,7 +732,7 @@ void AlphaSamplerAudioProcessor::runScript(const juce::File& script)
         const auto out = dataDir().getChildFile("Edits").getChildFile(in.getFileNameWithoutExtension() + "_" + script.getFileNameWithoutExtension() + ".wav").getNonexistentSibling();
         out.getParentDirectory().createDirectory();
         juce::StringArray tail { script.getFullPathName(), tmp_in.getFullPathName(), out.getFullPathName(),
-                                 "rate=" + juce::String(rate_.load()), "bpm=" + juce::String(bpm, 3), "root=" + juce::String(rt) };
+                                 "rate=" + juce::String(rate_.load()), "slices=" + sl_arg, "bpm=" + juce::String(bpm, 3), "root=" + juce::String(rt) };
         std::vector<juce::StringArray> cands;
         if (py.isNotEmpty()) cands.push_back({ py });
         else { cands.push_back({ "py", "-3" }); cands.push_back({ "python" }); cands.push_back({ "python3" }); }

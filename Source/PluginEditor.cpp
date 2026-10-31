@@ -725,19 +725,18 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
             if (id < 4) { mode = id; repaint(); }
             else if (id == 10) { showRaw = ! showRaw; repaint(); }
             else if (id == 11) { grid = (grid + 1) % 3; repaint(); }
+            else if (id == 20 || (id == 21 && selSlice >= 0)) dragOut = id;
             return;
         }
     drag = markerAt (e.position.x);
     panAnchor = z0;
     if (proc != nullptr && wave != nullptr && mode != Spectrum && tweak == nullptr)
     {
-        if (drag >= 100 && e.mods.isPopupMenu())
+        if (e.mods.isPopupMenu())
         {
-            auto v = proc->slices();
-            v.erase (v.begin() + (drag - 100));
-            proc->setSlices (v);
+            const int m = drag;
             drag = -1;
-            repaint();
+            markerMenu (e.position.x, m);
             return;
         }
         if (drag < 0 && e.mods.isShiftDown())
@@ -756,6 +755,18 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
 
 void WaveformView::mouseDrag (const juce::MouseEvent& e)
 {
+    if (e.getDistanceFromDragStart() > 3) moved = true;
+    if (dragOut != 0)
+    {
+        if (e.getDistanceFromDragStart() > 6 && proc != nullptr)
+        {
+            const auto f = proc->dragFile (dragOut == 21 ? selSlice : -1);
+            dragOut = 0;
+            if (f.existsAsFile())
+                juce::DragAndDropContainer::performExternalDragDropOfFiles ({ f.getFullPathName() }, false, this);
+        }
+        return;
+    }
     if (drag == 0) setNorm ("start_offset", toFrac (e.position.x), false, false);
     else if (drag == 1) setNorm ("loop_start", juce::jmin (toFrac (e.position.x), norm ("loop_end") - 0.001f), false, false);
     else if (drag == 2) setNorm ("loop_end", juce::jmax (toFrac (e.position.x), norm ("loop_start") + 0.001f), false, false);
@@ -780,8 +791,40 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
     }
 }
 
-void WaveformView::mouseUp (const juce::MouseEvent&)
+void WaveformView::markerMenu (float x, int marker)
 {
+    const float at = toFrac (x);
+    juce::PopupMenu m;
+    if (marker >= 100) m.addItem (1, "Remove marker " + juce::String (marker - 99));
+    else m.addItem (2, "Place marker here");
+    m.addItem (3, "Remove all markers", ! proc->slices().empty());
+    m.showMenuAsync (juce::PopupMenu::Options(), [this, at, marker, safe = juce::Component::SafePointer<WaveformView> (this)] (int r)
+    {
+        if (safe == nullptr || proc == nullptr || r == 0) return;
+        auto v = proc->slices();
+        if (r == 1 && (size_t) (marker - 100) < v.size()) v.erase (v.begin() + (marker - 100));
+        else if (r == 2) v.push_back (at);
+        else if (r == 3) v.clear();
+        proc->setSlices (v);
+        selSlice = -1;
+        repaint();
+    });
+}
+
+void WaveformView::mouseUp (const juce::MouseEvent& e)
+{
+    if (dragOut == 0 && drag < 0 && ! moved && proc != nullptr && e.getDistanceFromDragStart() < 4 && ! e.mods.isPopupMenu() && ! e.mods.isShiftDown()
+        && tweak == nullptr && mode != Spectrum)
+    {
+        const auto v = proc->slices();
+        const float f = toFrac (e.position.x);
+        int s = -1;
+        for (size_t i = 0; i < v.size(); ++i) if (v[i] <= f) s = (int) i;
+        selSlice = s == selSlice ? -1 : s;
+        repaint();
+    }
+    dragOut = 0;
+    moved = false;
     if (drag == 0) setNorm ("start_offset", norm ("start_offset"), false, true);
     else if (drag == 1) setNorm ("loop_start", norm ("loop_start"), false, true);
     else if (drag == 2) setNorm ("loop_end", norm ("loop_end"), false, true);
@@ -795,7 +838,17 @@ void WaveformView::mouseMove (const juce::MouseEvent& e)
 
 void WaveformView::mouseDoubleClick (const juce::MouseEvent& e)
 {
-    if (markerAt (e.position.x) < 0) { z0 = 0.0f; z1 = 1.0f; repaint(); }
+    const int m = markerAt (e.position.x);
+    if (m >= 100 && proc != nullptr)
+    {
+        auto v = proc->slices();
+        v.erase (v.begin() + (m - 100));
+        proc->setSlices (v);
+        selSlice = -1;
+        repaint();
+        return;
+    }
+    if (m < 0) { z0 = 0.0f; z1 = 1.0f; repaint(); }
 }
 
 void WaveformView::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
@@ -1051,6 +1104,13 @@ void WaveformView::paintIdle (juce::Graphics& g, juce::Rectangle<float> area, ju
         const bool on = norm ("slice_on") > 0.5f;
         g.saveState();
         g.reduceClipRegion (area.toNearestInt());
+        if (selSlice >= 0 && (size_t) selSlice < sl.size())
+        {
+            const float xa = toX (sl[(size_t) selSlice], area);
+            const float xb = (size_t) selSlice + 1 < sl.size() ? toX (sl[(size_t) selSlice + 1], area) : toX (1.0f, area);
+            g.setColour (col::amber.withAlpha (0.14f));
+            g.fillRect (juce::Rectangle<float> (xa, area.getY(), xb - xa, area.getHeight()));
+        }
         g.setFont (caps (9.f));
         for (size_t i = 0; i < sl.size(); ++i)
         {
@@ -1059,7 +1119,7 @@ void WaveformView::paintIdle (juce::Graphics& g, juce::Rectangle<float> area, ju
             g.drawVerticalLine ((int) x, area.getY(), area.getBottom());
             g.fillRect (x - 3.f, area.getY(), 7.f, 3.f);
             g.drawText (juce::String ((int) i + 1) + (on ? juce::String (" ") + juce::String (laws::note_name (proc->sliceBase() + (int) i)) : juce::String()),
-                        juce::Rectangle<float> (x + 3.f, area.getBottom() - 24.f, 60.f, 12.f), juce::Justification::centredLeft, false);
+                        juce::Rectangle<float> (x + 3.f, area.getBottom() - 40.f, 60.f, 12.f), juce::Justification::centredLeft, false);
         }
         g.restoreState();
     }
@@ -1068,6 +1128,24 @@ void WaveformView::paintIdle (juce::Graphics& g, juce::Rectangle<float> area, ju
         g.setFont (caps (9.f));
         g.setColour (col::textDim);
         g.drawText (juce::String (1.0f / (z1 - z0), 1) + "x  (double-click resets)", area.reduced (4.f), juce::Justification::topRight, false);
+    }
+    if (proc != nullptr)
+    {
+        auto row = area.removeFromBottom (18.f).reduced (2.f, 1.f);
+        auto chip = [&] (const juce::String& txt, int id, bool enabled)
+        {
+            auto r = row.removeFromRight (textWidth (txt) + 16.f);
+            row.removeFromRight (4.f);
+            g.setColour ((enabled ? col::amber : col::textFaint).withAlpha (0.18f));
+            g.fillRoundedRectangle (r, 3.f);
+            g.setColour (enabled ? col::amber : col::textFaint);
+            g.drawRoundedRectangle (r, 3.f, 1.f);
+            g.drawText (txt, r, juce::Justification::centred, false);
+            if (enabled) hits.push_back ({ r, id });
+        };
+        g.setFont (caps (9.f));
+        chip ("DRAG SAMPLE", 20, true);
+        chip (selSlice >= 0 ? "DRAG SLICE " + juce::String (selSlice + 1) : juce::String ("CLICK A SLICE TO SELECT"), 21, selSlice >= 0);
     }
 }
 
@@ -2042,6 +2120,8 @@ ToolsPage::ToolsPage (AlphaSamplerAudioProcessor& p) : proc (p)
     head (h1, "RENDER TO FILE");
     head (h2, "RECORD");
     head (h3, "PYTHON SCRIPT");
+    embed.setToggleState (true, juce::dontSendNotification);
+    embed.setColour (juce::ToggleButton::textColourId, pt::ui::col::textDim);
     for (auto* l : { &recLabel, &scriptLabel, &pyLabel, &statusLabel })
     {
         l->setFont (pt::ui::sans (12.f));
@@ -2076,7 +2156,7 @@ ToolsPage::ToolsPage (AlphaSamplerAudioProcessor& p) : proc (p)
                                   [this] (const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) proc.setPythonPath (fc.getResult().getFullPathName()); });
         });
     };
-    for (juce::Component* c : std::initializer_list<juce::Component*> { &renderBtn, &noteBtn, &loadAfter, &recBtn, &source, &scriptBtn, &runBtn, &revertBtn, &pyBtn })
+    for (juce::Component* c : std::initializer_list<juce::Component*> { &renderBtn, &noteBtn, &loadAfter, &embed, &recBtn, &source, &scriptBtn, &runBtn, &revertBtn, &pyBtn })
         addAndMakeVisible (c);
 }
 
@@ -2089,7 +2169,7 @@ void ToolsPage::saveAs (int mode)
                           {
                               auto f = fc.getResult();
                               if (f == juce::File()) return;
-                              proc.exportAudio (f.withFileExtension ("wav"), mode, loadAfter.getToggleState());
+                              proc.exportAudio (f.withFileExtension ("wav"), mode, loadAfter.getToggleState(), embed.getToggleState());
                           });
 }
 
@@ -2145,7 +2225,8 @@ void ToolsPage::resized()
     r.removeFromLeft (6);
     noteBtn.setBounds (r.removeFromLeft (150));
     r.removeFromLeft (14);
-    loadAfter.setBounds (r.removeFromLeft (220));
+    loadAfter.setBounds (r.removeFromLeft (200));
+    embed.setBounds (r.removeFromLeft (220));
     a.removeFromTop (18);
     h2.setBounds (a.removeFromTop (18));
     r = a.removeFromTop (30);

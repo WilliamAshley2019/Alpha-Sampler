@@ -434,6 +434,7 @@ struct Spectro
 
 using Fetch = std::function<void(size_t pos, size_t n, float* mono)>;
 std::shared_ptr<const Spectro> analyse(const Fetch& fetch, size_t frames, double rate);
+std::vector<uint32_t> wav_cues(const juce::File& f);   // cue-point sample offsets, sorted
 std::optional<double> detect_bpm(const std::vector<float>& mono, double rate, double& beats_out);
 
 struct WaveView
@@ -1076,8 +1077,9 @@ public:
     void runJob(std::function<void()> f);
     juce::String statusText() const;
     void setStatus(const juce::String& s);
-    void exportAudio(const juce::File& dest, int mode, bool load_after);   // 0 processed sample, 1 played note, 2 slices into folder dest
+    void exportAudio(const juce::File& dest, int mode, bool load_after, bool markers = false);   // 0 processed sample, 1 played note, 2 slices into folder dest
     void runScript(const juce::File& script);
+    juce::File dragFile(int slice);   // slice < 0: whole processed sample with cue markers; message thread, synchronous
     void revertEdit();
     void loadEdited(const juce::File& f);
     std::optional<std::pair<juce::File, bool>> takeLoadRequest();   // bool: result of an edit (original stays revertible)
@@ -1199,6 +1201,7 @@ private:
     bool processed_buffer(juce::AudioBuffer<float>& out, double& rate);
     void trigger(uint8_t note, float vel, const Block& b, int at);
     int slice_index(int note) const;
+    std::vector<uint32_t> cue_frames(int total) const;
     void record(const float* l, const float* r, int n) noexcept;
     void render_note(const juce::AudioBuffer<float>& src, double rate, juce::AudioBuffer<float>& out);
     std::atomic<int64_t> sample_mtime_ { 0 };

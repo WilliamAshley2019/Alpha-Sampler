@@ -269,7 +269,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AlphaSamplerAudioProcessor::
     keep_disk      = L.flag("keep_disk", "Keep on disk", false, true);
     resample       = L.flag("resample", "Resample", true);
     load_regions   = L.flag("load_regions", "Load regions", true);
-    load_slices    = L.flag("load_slices", "Load slice markers", false);
+    load_slices    = L.flag("load_slices", "Load slice markers", true);
     declick_mode   = L.choice("declick", "Declicking mode", { "Out only (no bleeding)", "Transient (no bleeding)",
                               "Transient (bleeding)", "Generic (bleeding)", "Smooth (bleeding)", "Crossfade (bleeding)" }, 0);
     start_offset   = L.knob("start_offset", "Sample start offset", 0.0f, Disp::Percent, true);
@@ -826,6 +826,12 @@ void AlphaSamplerAudioProcessor::load(const juce::File& path)
             loaded_path_ = path.getFullPathName().toStdString();
         }
         raw_version_.fetch_add(1);
+        if (load_slices->get() && slice_n_.load() == 0) {
+            const double total = s ? static_cast<double>(s->frames()) : lay ? static_cast<double>(lay->frames) : 0.0;
+            std::vector<float> v;
+            if (total > 0.0) for (uint32_t c : wav_cues(path)) v.push_back(static_cast<float>(static_cast<double>(c) / total));
+            if (!v.empty()) setSlices(std::move(v));
+        }
         sample_mtime_.store(path.getLastModificationTime().toMilliseconds());
         frames->store(s ? static_cast<uint32_t>(s->frames()) : 0);
         update_impl();

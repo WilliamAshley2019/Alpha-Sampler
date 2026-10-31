@@ -196,6 +196,7 @@ private:
     void paintIdle  (juce::Graphics&, juce::Rectangle<float> area, juce::Rectangle<float> header);
     void paintTweak (juce::Graphics&, juce::Rectangle<float> area, juce::Rectangle<float> header);
     void paintGrid  (juce::Graphics&, juce::Rectangle<float> area);
+    void markerMenu (float x, int marker);
     void paintSpectrum (juce::Graphics&, juce::Rectangle<float> area);
     float norm (const juce::String& id) const;
     float val  (const juce::String& id) const;
@@ -206,7 +207,8 @@ private:
     juce::AudioProcessorParameter* tweak = nullptr;
     float tweakValue = -1.0f;
     bool hover = false, busy = false, showRaw = false;
-    int mode = Wave, grid = 0, drag = -1;
+    int mode = Wave, grid = 0, drag = -1, selSlice = -1, dragOut = 0;
+    bool moved = false;
     float z0 = 0.0f, z1 = 1.0f, panAnchor = 0.0f;
     double tempo = 0.0;
     AlphaSamplerAudioProcessor* proc = nullptr;
@@ -385,7 +387,7 @@ private:
     AlphaSamplerAudioProcessor& proc;
     juce::TextButton renderBtn { "RENDER SAMPLE..." }, noteBtn { "RENDER NOTE..." }, recBtn { "REC" },
                      scriptBtn { "SCRIPT..." }, runBtn { "RUN" }, revertBtn { "REVERT" }, pyBtn { "PYTHON..." };
-    juce::ToggleButton loadAfter { "load result as sample" };
+    juce::ToggleButton loadAfter { "load result as sample" }, embed { "write slice markers (cue)" };
     juce::ComboBox source;
     juce::Label recLabel, scriptLabel, pyLabel, statusLabel, h1, h2, h3;
     std::unique_ptr<juce::FileChooser> chooser;
