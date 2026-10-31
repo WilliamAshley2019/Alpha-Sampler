@@ -1,6 +1,7 @@
 TRICK OR TREAT OCTOBER 31st 2026
 
 ADDED PYTHON SCRIPTS I added some starter editor scripts
+OPEN YOUR SCRIPT FOLDER IT IS LIKELY IN YOUR DOCUMENTS FOLDER documents/alphasampler/scripts   drop them into that folder then it will detect and you can use them. I'll add more scripts at some point, I have a list to work from 
 
 Note you need to AFAIK have python installed I make scripts for python 3.
 
