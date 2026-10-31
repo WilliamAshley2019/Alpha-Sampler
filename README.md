@@ -11,30 +11,56 @@ script_template.py
 Specific scripts added so far.. more to come as available currently testing these I think 
 
 bit_crush.py
+
 channel_swap.py
+
 dc_remove.py
+
 FadeIn.py
+
 FadeOut.py
+
 Gain.py
+
 haas.py
+
 highpass.py
+
 LoopCrossfade.py
+
 lowpass.py
+
 mid_side_encode.py
+
 pan.py
+
 PeakNormalize.py
+
 PitchShift.py
+
 polarize.py
+
 resample.py
+
 Reverse.py
+
 ring_mod.py
+
 RMSNormalize.py
+
 SoftClip.py
+
 stereo_to_mono.py THIS ONE DOESNT WORK NEED TO FINISH IT
+
 stereo_width.py
+
 TempoSync.py
+
 TrimSilence.py
+
 ZeroCrossingTrim.py
+
+
 
 
 Version 1.0.5
