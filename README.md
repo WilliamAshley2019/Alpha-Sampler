@@ -85,8 +85,8 @@ Version 1.0.4
 Added slicing its in the MISC tab. 
 
 Added slice exports so samples can not be exported 
-TODO move slice markers manually.
-TODO export WITH slice markers written the the wav file. compatible with other formats such as REX.
+~~TODO move slice markers manually.~~
+~~TODO export WITH slice markers written the the wav file.~~ compatible with other formats such as REX.
 
 render and RECORD Function etc.. HOWEVER USE A DIFFERENT INSTANCE OF ALPHA SAMPLER TO RECORD!!!!!!! it will overwrite your current sample loaded if your record in a used alpha sampler!!!! 
 TO DO ADD UNDO RECORD OVERWRITE 
@@ -107,16 +107,17 @@ Folders are just as they are appear  SOURCE  and third_party exactly as packaged
 
 Added GUI and drag and drop.  The next big tasks are:
 
-TODO add slice functions.... and
+~~TODO add slice functions.... and~~
 TODO see what I missed in terms of functionality that might be extractable from Chan Sampler or other GPL3 projects. One thing was addding the multicolour functions
 on the sample from chan sampler.  I will likely need to let this fester and breed in my mind for a while to figure out what exactly I want to use with it.
 The slicing is a 100% to do though.
 
-TODO want to add sample export / render 
+~~TODO want to add sample export / render~~ 
 
 
-TODO add sample render/export from the sampler.
-TODO  the ever elusive integration with python scripting.. hmm need to see if edison scripts can some how be integrated.
+~~TODO add sample render/export from the sampler.~~
+~~TODO  the ever elusive integration with python scripting.. hmm need to see if edison scripts can some how be integrated.~~
+
 
 This is very early but audio functions and basic GUI seem to be working
 
