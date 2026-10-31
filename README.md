@@ -1,3 +1,13 @@
+Version 1.0.5
+Added individual slice selection
+Added add remove slice markers
+Added drag and drop slice or sample into daw
+Samples now retain slice data both for load and export.
+
+Issues: I still havn't addressed the record function need to figure out how to go about that specifically as routing audio into a plugin from FL Studio is something I had to use global memory for in the past not sure if there is another way as routing has output but I can't find input into generators may need to loop back trhough paired effect plugin to handle audio bus routing functions.
+
+To do build partner plugin to act as loopback insert to handle audio handoff for inputs into the generator (defies fl studio state preventing feedback but its possible to bypass this issue using external memory.
+
 NOTE:  To be honest I am a little impressed with how capable this sampler is now running a few % CPU ... it actually gave me that feeling wow, pretty darn impressive for what it is........ I will have to test for a while to get a sense for it. And wh
 
 
