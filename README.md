@@ -1,3 +1,5 @@
+TO DO add gui function for the python script interactions maybe use a gui box that renders python visual elements ??? not sure how to go about that just yet but seems similar to the lua script protojuce stuff.
+
 TRICK OR TREAT OCTOBER 31st 2026
 
 ADDED PYTHON SCRIPTS I added some starter editor scripts
