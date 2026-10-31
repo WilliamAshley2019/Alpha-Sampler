@@ -1,9 +1,14 @@
 TRICK OR TREAT OCTOBER 31st 2026
+
 ADDED PYTHON SCRIPTS I added some starter editor scripts
+
 Note you need to AFAIK have python installed I make scripts for python 3.
+
 You can likely make scripts for whatever version of python you have installed of course but I am not cause I don't use those versions of python.
 
+
 Specific scripts added so far.. more to come as available currently testing these I think 
+
 bit_crush.py
 channel_swap.py
 dc_remove.py
