@@ -1,3 +1,69 @@
+TRICK OR TREAT OCTOBER 31st 2026
+
+ADDED PYTHON SCRIPTS I added some starter editor scripts
+OPEN YOUR SCRIPT FOLDER IT IS LIKELY IN YOUR DOCUMENTS FOLDER documents/alphasampler/scripts   drop them into that folder then it will detect and you can use them. I'll add more scripts at some point, I have a list to work from 
+
+Note you need to AFAIK have python installed I make scripts for python 3.
+
+You can likely make scripts for whatever version of python you have installed of course but I am not cause I don't use those versions of python.
+SEE SCRIPT_FORMAT.md
+script_template.py
+
+Specific scripts added so far.. more to come as available currently testing these I think 
+
+bit_crush.py
+
+channel_swap.py
+
+dc_remove.py
+
+FadeIn.py
+
+FadeOut.py
+
+Gain.py
+
+haas.py
+
+highpass.py
+
+LoopCrossfade.py
+
+lowpass.py
+
+mid_side_encode.py
+
+pan.py
+
+PeakNormalize.py
+
+PitchShift.py
+
+polarize.py
+
+resample.py
+
+Reverse.py
+
+ring_mod.py
+
+RMSNormalize.py
+
+SoftClip.py
+
+stereo_to_mono.py THIS ONE DOESNT WORK NEED TO FINISH IT
+
+stereo_width.py
+
+TempoSync.py
+
+TrimSilence.py
+
+ZeroCrossingTrim.py
+
+
+
+
 Version 1.0.5
 
 -Added individual slice selection
@@ -20,8 +86,8 @@ Version 1.0.4
 Added slicing its in the MISC tab. 
 
 Added slice exports so samples can not be exported 
-TODO move slice markers manually.
-TODO export WITH slice markers written the the wav file. compatible with other formats such as REX.
+~~TODO move slice markers manually.~~
+~~TODO export WITH slice markers written the the wav file.~~ compatible with other formats such as REX.
 
 render and RECORD Function etc.. HOWEVER USE A DIFFERENT INSTANCE OF ALPHA SAMPLER TO RECORD!!!!!!! it will overwrite your current sample loaded if your record in a used alpha sampler!!!! 
 TO DO ADD UNDO RECORD OVERWRITE 
@@ -42,16 +108,17 @@ Folders are just as they are appear  SOURCE  and third_party exactly as packaged
 
 Added GUI and drag and drop.  The next big tasks are:
 
-TODO add slice functions.... and
+~~TODO add slice functions.... and~~
 TODO see what I missed in terms of functionality that might be extractable from Chan Sampler or other GPL3 projects. One thing was addding the multicolour functions
 on the sample from chan sampler.  I will likely need to let this fester and breed in my mind for a while to figure out what exactly I want to use with it.
 The slicing is a 100% to do though.
 
-TODO want to add sample export / render 
+~~TODO want to add sample export / render~~ 
 
 
-TODO add sample render/export from the sampler.
-TODO  the ever elusive integration with python scripting.. hmm need to see if edison scripts can some how be integrated.
+~~TODO add sample render/export from the sampler.~~
+~~TODO  the ever elusive integration with python scripting.. hmm need to see if edison scripts can some how be integrated.~~
+
 
 This is very early but audio functions and basic GUI seem to be working
 
